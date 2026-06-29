@@ -268,17 +268,41 @@ def wait_result(symbol, score, price, rsi):
     }
 
 def _analyze_yf(ticker_symbol: str, display_symbol: str, tp_pct: float, sl_pct: float) -> dict:
-    """Универсальная функция анализа через Yahoo Finance."""
+    """Один запрос вместо двух — в 2 раза быстрее."""
     ticker = yf.Ticker(ticker_symbol)
 
-    # Тренд на длинном периоде
-    df_long = ticker.history(period="30d", interval="1h")
-    if df_long.empty:
+    # Один запрос — 7 дней хватает для EMA50, RSI, MACD, BB
+    df = ticker.history(period="7d", interval="1h")
+    if df.empty:
         raise ValueError(f"Нет данных по {display_symbol}")
-    df_long.columns = [c.lower() for c in df_long.columns]
-    df_long["e20"] = ta.ema(df_long["close"], length=20)
-    df_long["e50"] = ta.ema(df_long["close"], length=50)
-    trend = bool(df_long.iloc[-1]["e20"] > df_long.iloc[-1]["e50"])
+    df.columns = [c.lower() for c in df.columns]
+
+    # Тренд на тех же данных
+    df["e20"] = ta.ema(df["close"], length=20)
+    df["e50"] = ta.ema(df["close"], length=50)
+    trend = bool(df.iloc[-1]["e20"] > df.iloc[-1]["e50"])
+
+    # Сигналы
+    df["rsi"] = ta.rsi(df["close"], 14)
+    m = ta.macd(df["close"])
+    df["macd"] = m["MACD_12_26_9"]
+    df["ms"]   = m["MACDs_12_26_9"]
+    df["bbu"], df["bbl"] = get_bbands(df["close"])
+    df["vm"] = ta.sma(df["volume"], 20)
+
+    last = df.iloc[-1]
+    p   = float(last["close"])
+    rsi = round(float(last["rsi"]), 2)
+    vm  = float(last["vm"]) if float(last["vm"]) > 0 else 1.0
+    vr  = float(last["volume"]) / vm
+
+    bs, ss, br, sr = score_signal(
+        rsi, float(last["macd"]), float(last["ms"]),
+        p, float(last["bbu"]), float(last["bbl"]), trend, vr
+    )
+    if bs >= 4: return build_result(display_symbol, "LONG",  bs, p, tp_pct, sl_pct, rsi, br)
+    if ss >= 4: return build_result(display_symbol, "SHORT", ss, p, tp_pct, sl_pct, rsi, sr)
+    return wait_result(display_symbol, max(bs, ss), p, rsi)
 
     # Сигналы на 1H
     df = ticker.history(period="5d", interval="1h")
