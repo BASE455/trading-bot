@@ -8,7 +8,6 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, PreCheckoutQueryHandler, filters, ContextTypes
 )
-import ccxt
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
@@ -173,8 +172,7 @@ else:
         d[str(user_id)] = {
             "expiry": expiry.isoformat(),
             "granted_at": datetime.now().isoformat(),
-            "days": days,
-            "method": method
+            "days": days, "method": method
         }
         _save_j(PREM_FILE, d)
         return expiry.strftime("%d.%m.%Y")
@@ -203,7 +201,7 @@ else:
         return {"subs": len(get_subscribers()), "premium": premium}
 
 # ================================================================
-# АНАЛИЗ РЫНКА
+# АНАЛИЗ РЫНКА — Yahoo Finance (работает с US серверов)
 # ================================================================
 
 def get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -269,77 +267,52 @@ def wait_result(symbol, score, price, rsi):
         "reasons": ["Недостаточно подтверждений — ждём лучшей точки входа"]
     }
 
-def get_signal_btc() -> dict:
-    """BTC/USDT через Bybit — нет гео-блокировок."""
-    exchange = ccxt.bybit()  # ✅ Bybit вместо Binance
+def _analyze_yf(ticker_symbol: str, display_symbol: str, tp_pct: float, sl_pct: float) -> dict:
+    """Универсальная функция анализа через Yahoo Finance."""
+    ticker = yf.Ticker(ticker_symbol)
 
-    df4 = pd.DataFrame(
-        exchange.fetch_ohlcv("BTC/USDT", "4h", limit=60),
-        columns=["ts", "o", "h", "l", "close", "vol"]
-    )
-    df4["e20"] = ta.ema(df4["close"], length=20)
-    df4["e50"] = ta.ema(df4["close"], length=50)
-    trend = bool(df4.iloc[-1]["e20"] > df4.iloc[-1]["e50"])
+    # Тренд на длинном периоде
+    df_long = ticker.history(period="30d", interval="1h")
+    if df_long.empty:
+        raise ValueError(f"Нет данных по {display_symbol}")
+    df_long.columns = [c.lower() for c in df_long.columns]
+    df_long["e20"] = ta.ema(df_long["close"], length=20)
+    df_long["e50"] = ta.ema(df_long["close"], length=50)
+    trend = bool(df_long.iloc[-1]["e20"] > df_long.iloc[-1]["e50"])
 
-    df = pd.DataFrame(
-        exchange.fetch_ohlcv("BTC/USDT", "1h", limit=100),
-        columns=["ts", "o", "h", "l", "close", "vol"]
-    )
+    # Сигналы на 1H
+    df = ticker.history(period="5d", interval="1h")
+    if df.empty:
+        raise ValueError(f"Нет данных по {display_symbol} (1H)")
+    df.columns = [c.lower() for c in df.columns]
     df["rsi"] = ta.rsi(df["close"], 14)
     m = ta.macd(df["close"])
     df["macd"] = m["MACD_12_26_9"]
     df["ms"]   = m["MACDs_12_26_9"]
     df["bbu"], df["bbl"] = get_bbands(df["close"])
-    df["vm"] = ta.sma(df["vol"], 20)
+    df["vm"] = ta.sma(df["volume"], 20)
 
     last = df.iloc[-1]
     p   = float(last["close"])
     rsi = round(float(last["rsi"]), 2)
-    vr  = float(last["vol"]) / float(last["vm"]) if float(last["vm"]) > 0 else 1.0
+    vm  = float(last["vm"]) if float(last["vm"]) > 0 else 1.0
+    vr  = float(last["volume"]) / vm
 
     bs, ss, br, sr = score_signal(
         rsi, float(last["macd"]), float(last["ms"]),
         p, float(last["bbu"]), float(last["bbl"]), trend, vr
     )
-    if bs >= 4: return build_result("BTC/USDT", "LONG",  bs, p, 0.04, 0.02, rsi, br)
-    if ss >= 4: return build_result("BTC/USDT", "SHORT", ss, p, 0.04, 0.02, rsi, sr)
-    return wait_result("BTC/USDT", max(bs, ss), p, rsi)
+    if bs >= 4: return build_result(display_symbol, "LONG",  bs, p, tp_pct, sl_pct, rsi, br)
+    if ss >= 4: return build_result(display_symbol, "SHORT", ss, p, tp_pct, sl_pct, rsi, sr)
+    return wait_result(display_symbol, max(bs, ss), p, rsi)
+
+def get_signal_btc() -> dict:
+    """BTC через Yahoo Finance — BTC-USD."""
+    return _analyze_yf("BTC-USD", "BTC/USD", tp_pct=0.04, sl_pct=0.02)
 
 def get_signal_gold() -> dict:
-    """XAUUSD через Bybit (XAUUSDT) — быстро и надёжно."""
-    exchange = ccxt.bybit()  # ✅ Bybit вместо yfinance
-
-    df4 = pd.DataFrame(
-        exchange.fetch_ohlcv("XAU/USDT", "4h", limit=60),
-        columns=["ts", "o", "h", "l", "close", "vol"]
-    )
-    df4["e20"] = ta.ema(df4["close"], length=20)
-    df4["e50"] = ta.ema(df4["close"], length=50)
-    trend = bool(df4.iloc[-1]["e20"] > df4.iloc[-1]["e50"])
-
-    df = pd.DataFrame(
-        exchange.fetch_ohlcv("XAU/USDT", "1h", limit=100),
-        columns=["ts", "o", "h", "l", "close", "vol"]
-    )
-    df["rsi"] = ta.rsi(df["close"], 14)
-    m = ta.macd(df["close"])
-    df["macd"] = m["MACD_12_26_9"]
-    df["ms"]   = m["MACDs_12_26_9"]
-    df["bbu"], df["bbl"] = get_bbands(df["close"])
-    df["vm"] = ta.sma(df["vol"], 20)
-
-    last = df.iloc[-1]
-    p   = float(last["close"])
-    rsi = round(float(last["rsi"]), 2)
-    vr  = float(last["vol"]) / float(last["vm"]) if float(last["vm"]) > 0 else 1.0
-
-    bs, ss, br, sr = score_signal(
-        rsi, float(last["macd"]), float(last["ms"]),
-        p, float(last["bbu"]), float(last["bbl"]), trend, vr
-    )
-    if bs >= 4: return build_result("XAUUSD", "LONG",  bs, p, 0.015, 0.0075, rsi, br)
-    if ss >= 4: return build_result("XAUUSD", "SHORT", ss, p, 0.015, 0.0075, rsi, sr)
-    return wait_result("XAUUSD", max(bs, ss), p, rsi)
+    """Gold через Yahoo Finance — GC=F."""
+    return _analyze_yf("GC=F", "XAUUSD", tp_pct=0.015, sl_pct=0.0075)
 
 # ================================================================
 # ФОРМАТИРОВАНИЕ
@@ -431,7 +404,7 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[
-        InlineKeyboardButton("₿ BTC/USDT", callback_data="sig_btc"),
+        InlineKeyboardButton("₿ BTC/USD", callback_data="sig_btc"),
         InlineKeyboardButton("🥇 XAUUSD", callback_data="sig_gold"),
     ]]
     await update.message.reply_text(
@@ -504,7 +477,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # ---- Сигналы ----
     if query.data in ("sig_btc", "sig_gold"):
         await query.edit_message_text("🔍 Анализирую рынок по 5 индикаторам...")
         try:
@@ -515,7 +487,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка сигнала: {e}")
             await query.edit_message_text(f"❌ Ошибка: {str(e)}")
 
-    # ---- Telegram Stars ----
     elif query.data == "pay_stars":
         await query.message.delete()
         await context.bot.send_invoice(
@@ -528,7 +499,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prices=[LabeledPrice("Premium 30 дней", PREMIUM_STARS)]
         )
 
-    # ---- Kaspi ----
     elif query.data == "pay_kaspi":
         user = query.from_user
         context.user_data["waiting_kaspi"] = True
@@ -545,7 +515,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ================================================================
-# TELEGRAM STARS: оплата
+# TELEGRAM STARS
 # ================================================================
 
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -570,14 +540,12 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Не удалось уведомить админа: {e}")
     await update.message.reply_text(
-        f"🎉 *Premium активирован!*\n\n"
-        f"До: `{expiry_str}`\n\n"
-        f"Попробуй: /signal",
+        f"🎉 *Premium активирован!*\n\nДо: `{expiry_str}`\n\nПопробуй: /signal",
         parse_mode="Markdown"
     )
 
 # ================================================================
-# KASPI: скриншот
+# KASPI
 # ================================================================
 
 async def screenshot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -600,9 +568,7 @@ async def screenshot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.forward_message(
             ADMIN_ID, update.message.chat_id, update.message.message_id
         )
-        await update.message.reply_text(
-            "✅ Скриншот получен! Открываем доступ за 15 минут 🎉"
-        )
+        await update.message.reply_text("✅ Скриншот получен! Открываем доступ за 15 минут 🎉")
         logger.info(f"Kaspi чек от {user.id} ({username})")
     except Exception as e:
         logger.error(f"Ошибка скриншота: {e}")
@@ -613,13 +579,9 @@ async def screenshot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ================================================================
 
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     if not context.args:
-        await update.message.reply_text(
-            "Использование: `/approve USER_ID [дней]`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Использование: `/approve USER_ID [дней]`", parse_mode="Markdown")
         return
     try:
         uid = int(context.args[0])
@@ -628,42 +590,28 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text=(
-                    f"🎉 *Premium активирован!*\n\n"
-                    f"Подписка на {days} дней — до `{expiry_str}`\n\n"
-                    f"Попробуй: /signal"
-                ),
+                text=f"🎉 *Premium активирован!*\n\nДо: `{expiry_str}`\n\nПопробуй: /signal",
                 parse_mode="Markdown"
             )
         except Exception as e:
             logger.error(f"Не смог уведомить {uid}: {e}")
         await update.message.reply_text(
-            f"✅ Premium выдан `{uid}` до {expiry_str}",
-            parse_mode="Markdown"
+            f"✅ Premium выдан `{uid}` до {expiry_str}", parse_mode="Markdown"
         )
         logger.info(f"Admin approve: {uid} на {days} дней")
     except ValueError:
-        await update.message.reply_text(
-            "❌ Пример: `/approve 123456789`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("❌ Пример: `/approve 123456789`", parse_mode="Markdown")
 
 async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     if not context.args:
-        await update.message.reply_text(
-            "Использование: `/revoke USER_ID`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Использование: `/revoke USER_ID`", parse_mode="Markdown")
         return
-    uid = int(context.args[0])
-    remove_premium(uid)
-    await update.message.reply_text(f"✅ Premium отозван у {uid}")
+    remove_premium(int(context.args[0]))
+    await update.message.reply_text(f"✅ Premium отозван у {context.args[0]}")
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     stats = get_stats()
     text = (
         f"📊 *Статистика*\n\n"
@@ -685,8 +633,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
     subs = get_subscribers()
     if not subs:
-        logger.info("Нет подписчиков")
-        return
+        logger.info("Нет подписчиков"); return
 
     logger.info(f"Автосигналы: {len(subs)} подписчиков")
     to_send = []
@@ -703,8 +650,7 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка {name}: {e}")
 
     if not to_send:
-        logger.info("Нет сигналов — пропускаем")
-        return
+        logger.info("Нет сигналов — пропускаем"); return
 
     dead = set()
     for cid in subs.copy():
