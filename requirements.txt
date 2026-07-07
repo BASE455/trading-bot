@@ -1,7 +1,7 @@
 python-telegram-bot[job-queue]==21.6
-ccxt
 pandas
 pandas-ta
 yfinance
 python-dotenv
 psycopg2-binary
+feedparser

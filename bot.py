@@ -1,16 +1,17 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+import asyncio
+import time
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, PreCheckoutQueryHandler, filters, ContextTypes
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
+import feedparser
 
 # ================================================================
 # КОНФИГУРАЦИЯ
@@ -26,15 +27,10 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
 ADMIN_ID     = int(os.getenv("ADMIN_ID"))
-KASPI_PHONE  = os.getenv("KASPI_PHONE")
-KASPI_NAME   = os.getenv("KASPI_NAME")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-PREMIUM_DAYS  = 30
-PREMIUM_STARS = 500
-
 # ================================================================
-# ХРАНИЛИЩЕ
+# ХРАНИЛИЩЕ (только подписчики, без Premium)
 # ================================================================
 
 if DATABASE_URL:
@@ -46,18 +42,9 @@ if DATABASE_URL:
     def init_storage():
         with _conn() as c:
             with c.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS subscribers (
-                        chat_id BIGINT PRIMARY KEY
-                    );
-                    CREATE TABLE IF NOT EXISTS premium_users (
-                        user_id BIGINT PRIMARY KEY,
-                        expiry TIMESTAMPTZ NOT NULL,
-                        granted_at TIMESTAMPTZ DEFAULT NOW(),
-                        days INT DEFAULT 30,
-                        method TEXT DEFAULT 'manual'
-                    );
-                """)
+                cur.execute(
+                    "CREATE TABLE IF NOT EXISTS subscribers (chat_id BIGINT PRIMARY KEY);"
+                )
             c.commit()
         logger.info("PostgreSQL инициализирован")
 
@@ -82,129 +69,92 @@ if DATABASE_URL:
                 cur.execute("DELETE FROM subscribers WHERE chat_id = %s", (chat_id,))
             c.commit()
 
-    def is_premium(user_id: int) -> bool:
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM premium_users WHERE user_id=%s AND expiry>NOW()",
-                    (user_id,)
-                )
-                return cur.fetchone() is not None
-
-    def add_premium(user_id: int, days: int, method: str = "manual") -> str:
-        expiry = datetime.now() + timedelta(days=days)
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO premium_users (user_id, expiry, days, method)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        expiry=EXCLUDED.expiry, granted_at=NOW(),
-                        days=EXCLUDED.days, method=EXCLUDED.method
-                """, (user_id, expiry, days, method))
-            c.commit()
-        return expiry.strftime("%d.%m.%Y")
-
-    def remove_premium(user_id: int):
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute("DELETE FROM premium_users WHERE user_id=%s", (user_id,))
-            c.commit()
-
-    def get_expiry(user_id: int) -> str:
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute("SELECT expiry FROM premium_users WHERE user_id=%s", (user_id,))
-                row = cur.fetchone()
-                return row[0].strftime("%d.%m.%Y") if row else "—"
-
-    def get_stats() -> dict:
-        now = datetime.now()
+    def count_subscribers() -> int:
         with _conn() as c:
             with c.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM subscribers")
-                subs = cur.fetchone()[0]
-                cur.execute(
-                    "SELECT user_id, expiry, method FROM premium_users WHERE expiry>NOW() ORDER BY expiry"
-                )
-                rows = cur.fetchall()
-        premium = []
-        for uid, expiry, method in rows:
-            days_left = (expiry.replace(tzinfo=None) - now).days
-            premium.append({
-                "user_id": uid,
-                "expiry_str": expiry.strftime("%d.%m.%Y"),
-                "days_left": days_left,
-                "method": method or "—"
-            })
-        return {"subs": subs, "premium": premium}
+                return cur.fetchone()[0]
 
 else:
     SUBS_FILE = "subscribers.json"
-    PREM_FILE = "premium.json"
 
     def init_storage(): pass
 
-    def _load_j(f, default):
-        return json.load(open(f)) if os.path.exists(f) else default
+    def _load_s(): return json.load(open(SUBS_FILE)) if os.path.exists(SUBS_FILE) else []
+    def _save_s(d):
+        with open(SUBS_FILE, "w") as f: json.dump(d, f)
 
-    def _save_j(f, d):
-        with open(f, "w") as fp:
-            json.dump(d, fp, ensure_ascii=False, indent=2)
-
-    def get_subscribers() -> set:
-        return set(_load_j(SUBS_FILE, []))
-
-    def add_subscriber(chat_id: int):
-        s = get_subscribers(); s.add(chat_id); _save_j(SUBS_FILE, list(s))
-
-    def remove_subscriber(chat_id: int):
-        s = get_subscribers(); s.discard(chat_id); _save_j(SUBS_FILE, list(s))
-
-    def is_premium(user_id: int) -> bool:
-        d = _load_j(PREM_FILE, {})
-        k = str(user_id)
-        return k in d and datetime.now() < datetime.fromisoformat(d[k]["expiry"])
-
-    def add_premium(user_id: int, days: int, method: str = "manual") -> str:
-        d = _load_j(PREM_FILE, {})
-        expiry = datetime.now() + timedelta(days=days)
-        d[str(user_id)] = {
-            "expiry": expiry.isoformat(),
-            "granted_at": datetime.now().isoformat(),
-            "days": days, "method": method
-        }
-        _save_j(PREM_FILE, d)
-        return expiry.strftime("%d.%m.%Y")
-
-    def remove_premium(user_id: int):
-        d = _load_j(PREM_FILE, {}); d.pop(str(user_id), None); _save_j(PREM_FILE, d)
-
-    def get_expiry(user_id: int) -> str:
-        d = _load_j(PREM_FILE, {})
-        k = str(user_id)
-        return datetime.fromisoformat(d[k]["expiry"]).strftime("%d.%m.%Y") if k in d else "—"
-
-    def get_stats() -> dict:
-        d = _load_j(PREM_FILE, {})
-        now = datetime.now()
-        premium = []
-        for uid, v in d.items():
-            expiry = datetime.fromisoformat(v["expiry"])
-            if expiry > now:
-                premium.append({
-                    "user_id": uid,
-                    "expiry_str": expiry.strftime("%d.%m.%Y"),
-                    "days_left": (expiry - now).days,
-                    "method": v.get("method", "—")
-                })
-        return {"subs": len(get_subscribers()), "premium": premium}
+    def get_subscribers() -> set: return set(_load_s())
+    def add_subscriber(cid: int): s = get_subscribers(); s.add(cid); _save_s(list(s))
+    def remove_subscriber(cid: int): s = get_subscribers(); s.discard(cid); _save_s(list(s))
+    def count_subscribers() -> int: return len(get_subscribers())
 
 # ================================================================
-# АНАЛИЗ РЫНКА — Yahoo Finance (работает с US серверов)
+# АНАЛИЗ НОВОСТЕЙ (RSS + ключевые слова)
 # ================================================================
 
-def get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
+_news_cache: dict = {}
+NEWS_TTL = 1800  # кэш 30 минут
+
+BTC_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+]
+GOLD_FEEDS = [
+    "https://www.kitco.com/rss/",
+    "https://feeds.reuters.com/reuters/businessNews",
+]
+
+BULLISH_WORDS = [
+    "bull", "surge", "rally", "gain", "rise", "soar", "jump", "high",
+    "breakout", "buy", "long", "positive", "adoption", "approval",
+    "etf", "growth", "support", "recovery", "rebound", "record",
+    "boost", "strong", "milestone", "inflow"
+]
+BEARISH_WORDS = [
+    "bear", "crash", "drop", "fall", "plunge", "dump", "sell",
+    "short", "negative", "ban", "hack", "fear", "panic",
+    "warning", "risk", "concern", "weak", "loss", "decline",
+    "collapse", "trouble", "restrict", "regulation", "outflow"
+]
+
+def _fetch_news(symbol: str) -> tuple[int, str]:
+    """Возвращает (score, текст): +1 бычьи, 0 нейтральные, -1 медвежьи."""
+    now = time.time()
+    if symbol in _news_cache:
+        ts, score, text = _news_cache[symbol]
+        if now - ts < NEWS_TTL:
+            return score, text
+
+    feeds = BTC_FEEDS if "BTC" in symbol else GOLD_FEEDS
+    bull, bear = 0, 0
+
+    for url in feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                t = entry.get("title", "").lower()
+                bull += sum(1 for w in BULLISH_WORDS if w in t)
+                bear += sum(1 for w in BEARISH_WORDS if w in t)
+        except Exception as e:
+            logger.warning(f"RSS ошибка {url}: {e}")
+
+    if bull > bear:
+        score, text = 1, f"Позитивный (🟢{bull} бычьих / 🔴{bear} медвежьих)"
+    elif bear > bull:
+        score, text = -1, f"Негативный (🔴{bear} медвежьих / 🟢{bull} бычьих)"
+    else:
+        score, text = 0, "Нейтральный"
+
+    _news_cache[symbol] = (now, score, text)
+    logger.info(f"Новости {symbol}: {text}")
+    return score, text
+
+# ================================================================
+# ТЕХНИЧЕСКИЙ АНАЛИЗ
+# ================================================================
+
+def _get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     bb = ta.bbands(series, length=20, std=2)
     if bb is None or bb.empty:
         return series * 1.02, series * 0.98
@@ -212,165 +162,136 @@ def get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     l = [c for c in bb.columns if c.startswith("BBL")][0]
     return bb[u], bb[l]
 
-def score_signal(rsi, macd, macd_signal, price, bb_upper, bb_lower, trend_bullish, vol_ratio):
+def _score_technical(rsi, macd, macd_s, price, bbu, bbl, trend_bull, vol_ratio):
     bs, ss, br, sr = 0, 0, [], []
-    if rsi < 30:
-        bs += 1; br.append(f"RSI перепродан ({rsi})")
-    elif rsi > 70:
-        ss += 1; sr.append(f"RSI перекуплен ({rsi})")
-    if macd > macd_signal:
-        bs += 1; br.append("MACD бычий импульс")
-    else:
-        ss += 1; sr.append("MACD медвежий импульс")
-    if price <= bb_lower * 1.005:
-        bs += 1; br.append("Цена у нижней BB (зона покупки)")
-    elif price >= bb_upper * 0.995:
-        ss += 1; sr.append("Цена у верхней BB (зона продажи)")
-    if trend_bullish:
-        bs += 1; br.append("4H тренд восходящий (EMA20 > EMA50)")
-    else:
-        ss += 1; sr.append("4H тренд нисходящий (EMA20 < EMA50)")
+
+    if rsi < 30:   bs += 1; br.append(f"RSI перепродан ({rsi})")
+    elif rsi > 70: ss += 1; sr.append(f"RSI перекуплен ({rsi})")
+
+    if macd > macd_s: bs += 1; br.append("MACD бычий импульс")
+    else:             ss += 1; sr.append("MACD медвежий импульс")
+
+    if price <= bbl * 1.005:   bs += 1; br.append("Цена у нижней BB (зона покупки)")
+    elif price >= bbu * 0.995: ss += 1; sr.append("Цена у верхней BB (зона продажи)")
+
+    if trend_bull: bs += 1; br.append("4H тренд восходящий (EMA20 > EMA50)")
+    else:          ss += 1; sr.append("4H тренд нисходящий (EMA20 < EMA50)")
+
     if vol_ratio >= 1.5:
-        if bs >= ss:
-            bs += 1; br.append(f"Объём подтверждает рост (×{round(vol_ratio,1)})")
-        else:
-            ss += 1; sr.append(f"Объём подтверждает падение (×{round(vol_ratio,1)})")
+        if bs >= ss: bs += 1; br.append(f"Объём подтверждает рост (×{round(vol_ratio,1)})")
+        else:        ss += 1; sr.append(f"Объём подтверждает падение (×{round(vol_ratio,1)})")
+
     return bs, ss, br, sr
 
-def build_result(symbol, direction, score, price, tp_pct, sl_pct, rsi, reasons):
-    strength = "🔥 СИЛЬНЫЙ" if score == 5 else "✅ ХОРОШИЙ"
-    if direction == "LONG":
+def _analyze(ticker_symbol: str, display_symbol: str, tp: float, sl: float) -> dict:
+    """
+    Полный анализ: 5 технических индикаторов + новости.
+    Запускается в отдельном потоке (asyncio.to_thread).
+    """
+    # --- Технический анализ ---
+    df = yf.Ticker(ticker_symbol).history(period="7d", interval="1h")
+    if df.empty:
+        raise ValueError(f"Нет данных: {display_symbol}")
+
+    df.columns = [c.lower() for c in df.columns]
+    df["e20"]  = ta.ema(df["close"], 20)
+    df["e50"]  = ta.ema(df["close"], 50)
+    trend      = bool(df.iloc[-1]["e20"] > df.iloc[-1]["e50"])
+    df["rsi"]  = ta.rsi(df["close"], 14)
+    m          = ta.macd(df["close"])
+    df["macd"] = m["MACD_12_26_9"]
+    df["ms"]   = m["MACDs_12_26_9"]
+    df["bbu"], df["bbl"] = _get_bbands(df["close"])
+    df["vm"]   = ta.sma(df["volume"], 20)
+
+    last = df.iloc[-1]
+    p    = float(last["close"])
+    rsi  = round(float(last["rsi"]), 2)
+    vm   = float(last["vm"]) or 1.0
+    vr   = float(last["volume"]) / vm
+
+    bs, ss, br, sr = _score_technical(
+        rsi, float(last["macd"]), float(last["ms"]),
+        p, float(last["bbu"]), float(last["bbl"]), trend, vr
+    )
+
+    # --- Новости ---
+    news_score, news_text = _fetch_news(display_symbol)
+
+    def _strength(sc: int) -> str:
+        if sc == 5: return "🔥 СИЛЬНЫЙ"
+        if sc >= 4: return "✅ ХОРОШИЙ"
+        return "—"
+
+    # --- Сборка результата ---
+    if bs >= 4:
+        # Новости подтверждают LONG → добавляем в подтверждения
+        if news_score > 0:
+            br.append(f"📰 Новостной фон: {news_text}")
+            news_warning = None
+        else:
+            news_warning = f"📰 Новостной фон: {news_text}"
         return {
-            "symbol": symbol, "direction": "🟢 ПОКУПАЙ (LONG)",
-            "strength": strength, "score": f"{score}/5",
-            "entry": round(price, 2),
-            "take_profit": round(price * (1 + tp_pct), 2),
-            "stop_loss": round(price * (1 - sl_pct), 2),
-            "rsi": rsi, "reasons": reasons
+            "symbol": display_symbol,
+            "direction": "🟢 ПОКУПАЙ (LONG)",
+            "strength": _strength(bs),
+            "score": f"{bs}/5",
+            "entry": round(p, 2),
+            "take_profit": round(p * (1 + tp), 2),
+            "stop_loss": round(p * (1 - sl), 2),
+            "rsi": rsi,
+            "reasons": br,
+            "news_warning": news_warning,
         }
-    return {
-        "symbol": symbol, "direction": "🔴 ПРОДАВАЙ (SHORT)",
-        "strength": strength, "score": f"{score}/5",
-        "entry": round(price, 2),
-        "take_profit": round(price * (1 - tp_pct), 2),
-        "stop_loss": round(price * (1 + sl_pct), 2),
-        "rsi": rsi, "reasons": reasons
-    }
 
-def wait_result(symbol, score, price, rsi):
-    return {
-        "symbol": symbol, "direction": "⚪️ ЖДАТЬ",
-        "strength": "—", "score": f"{score}/5",
-        "entry": round(price, 2),
-        "take_profit": None, "stop_loss": None,
-        "rsi": rsi,
-        "reasons": ["Недостаточно подтверждений — ждём лучшей точки входа"]
-    }
+    elif ss >= 4:
+        # Новости подтверждают SHORT → добавляем в подтверждения
+        if news_score < 0:
+            sr.append(f"📰 Новостной фон: {news_text}")
+            news_warning = None
+        else:
+            news_warning = f"📰 Новостной фон: {news_text}"
+        return {
+            "symbol": display_symbol,
+            "direction": "🔴 ПРОДАВАЙ (SHORT)",
+            "strength": _strength(ss),
+            "score": f"{ss}/5",
+            "entry": round(p, 2),
+            "take_profit": round(p * (1 - tp), 2),
+            "stop_loss": round(p * (1 + sl), 2),
+            "rsi": rsi,
+            "reasons": sr,
+            "news_warning": news_warning,
+        }
 
-def _analyze_yf(ticker_symbol: str, display_symbol: str, tp_pct: float, sl_pct: float) -> dict:
-    """Один запрос вместо двух — в 2 раза быстрее."""
-    ticker = yf.Ticker(ticker_symbol)
+    else:
+        return {
+            "symbol": display_symbol,
+            "direction": "⚪️ ЖДАТЬ",
+            "strength": "—",
+            "score": f"{max(bs, ss)}/5",
+            "entry": round(p, 2),
+            "take_profit": None,
+            "stop_loss": None,
+            "rsi": rsi,
+            "reasons": ["Недостаточно подтверждений — ждём лучшей точки входа"],
+            "news_warning": f"📰 Новостной фон: {news_text}",
+        }
 
-    # Один запрос — 7 дней хватает для EMA50, RSI, MACD, BB
-    df = ticker.history(period="7d", interval="1h")
-    if df.empty:
-        raise ValueError(f"Нет данных по {display_symbol}")
-    df.columns = [c.lower() for c in df.columns]
-
-    # Тренд на тех же данных
-    df["e20"] = ta.ema(df["close"], length=20)
-    df["e50"] = ta.ema(df["close"], length=50)
-    trend = bool(df.iloc[-1]["e20"] > df.iloc[-1]["e50"])
-
-    # Сигналы
-    df["rsi"] = ta.rsi(df["close"], 14)
-    m = ta.macd(df["close"])
-    df["macd"] = m["MACD_12_26_9"]
-    df["ms"]   = m["MACDs_12_26_9"]
-    df["bbu"], df["bbl"] = get_bbands(df["close"])
-    df["vm"] = ta.sma(df["volume"], 20)
-
-    last = df.iloc[-1]
-    p   = float(last["close"])
-    rsi = round(float(last["rsi"]), 2)
-    vm  = float(last["vm"]) if float(last["vm"]) > 0 else 1.0
-    vr  = float(last["volume"]) / vm
-
-    bs, ss, br, sr = score_signal(
-        rsi, float(last["macd"]), float(last["ms"]),
-        p, float(last["bbu"]), float(last["bbl"]), trend, vr
-    )
-    if bs >= 4: return build_result(display_symbol, "LONG",  bs, p, tp_pct, sl_pct, rsi, br)
-    if ss >= 4: return build_result(display_symbol, "SHORT", ss, p, tp_pct, sl_pct, rsi, sr)
-    return wait_result(display_symbol, max(bs, ss), p, rsi)
-
-    # Сигналы на 1H
-    df = ticker.history(period="5d", interval="1h")
-    if df.empty:
-        raise ValueError(f"Нет данных по {display_symbol} (1H)")
-    df.columns = [c.lower() for c in df.columns]
-    df["rsi"] = ta.rsi(df["close"], 14)
-    m = ta.macd(df["close"])
-    df["macd"] = m["MACD_12_26_9"]
-    df["ms"]   = m["MACDs_12_26_9"]
-    df["bbu"], df["bbl"] = get_bbands(df["close"])
-    df["vm"] = ta.sma(df["volume"], 20)
-
-    last = df.iloc[-1]
-    p   = float(last["close"])
-    rsi = round(float(last["rsi"]), 2)
-    vm  = float(last["vm"]) if float(last["vm"]) > 0 else 1.0
-    vr  = float(last["volume"]) / vm
-
-    bs, ss, br, sr = score_signal(
-        rsi, float(last["macd"]), float(last["ms"]),
-        p, float(last["bbu"]), float(last["bbl"]), trend, vr
-    )
-    if bs >= 4: return build_result(display_symbol, "LONG",  bs, p, tp_pct, sl_pct, rsi, br)
-    if ss >= 4: return build_result(display_symbol, "SHORT", ss, p, tp_pct, sl_pct, rsi, sr)
-    return wait_result(display_symbol, max(bs, ss), p, rsi)
-
-def get_signal_btc() -> dict:
-    """BTC через Yahoo Finance — BTC-USD."""
-    return _analyze_yf("BTC-USD", "BTC/USD", tp_pct=0.04, sl_pct=0.02)
-
-def get_signal_gold() -> dict:
-    """Gold через Yahoo Finance — GC=F."""
-    return _analyze_yf("GC=F", "XAUUSD", tp_pct=0.015, sl_pct=0.0075)
+def _btc():  return _analyze("BTC-USD", "BTC/USD", 0.04,  0.02)
+def _gold(): return _analyze("GC=F",    "XAUUSD",  0.015, 0.0075)
 
 # ================================================================
 # ФОРМАТИРОВАНИЕ
 # ================================================================
 
-def format_free(data: dict) -> str:
-    symbol = data["symbol"]
-    if data["take_profit"]:
-        return (
-            f"📊 *Сигнал {symbol}*\n\n"
-            f"Направление: {data['direction']}\n"
-            f"Сила сигнала: {data['strength']} `({data['score']})`\n\n"
-            f"📍 Точка входа: `🔒 Premium`\n"
-            f"🎯 Тейк-профит: `🔒 Premium`\n"
-            f"🛡 Стоп-лосс: `🔒 Premium`\n\n"
-            f"📈 RSI: `{data['rsi']}`\n\n"
-            f"💡 Сигнал найден — точки входа только для Premium.\n"
-            f"/buy — оформить за 4 990 ₸/мес"
-        )
-    return (
-        f"📊 *Сигнал {symbol}*\n\n"
-        f"Направление: {data['direction']}\n"
-        f"Подтверждений: `{data['score']}` — нужно минимум 4/5\n\n"
-        f"💵 Цена: `${data['entry']}`\n"
-        f"📈 RSI: `{data['rsi']}`\n\n"
-        f"⏳ Ждём чёткого сигнала...\n\n"
-        f"⚠️ Не является финансовым советом"
-    )
+def fmt(data: dict, is_auto: bool = False) -> str:
+    sym    = data["symbol"]
+    header = f"🔔 *Автосигнал {sym}*\n\n" if is_auto else f"📊 *Сигнал {sym}*\n\n"
 
-def format_premium(data: dict, is_auto: bool = False) -> str:
-    symbol = data["symbol"]
-    header = f"🔔 *Автосигнал {symbol}*\n\n" if is_auto else f"📊 *Сигнал {symbol}*\n\n"
     if data["take_profit"]:
-        reasons = "\n".join([f"  ✅ {r}" for r in data["reasons"]])
+        reasons   = "\n".join(f"  ✅ {r}" for r in data["reasons"])
+        news_line = f"\n⚠️ *Осторожно:* {data['news_warning']}" if data.get("news_warning") else ""
         return (
             f"{header}"
             f"Направление: {data['direction']}\n"
@@ -378,63 +299,74 @@ def format_premium(data: dict, is_auto: bool = False) -> str:
             f"📍 Точка входа: `${data['entry']}`\n"
             f"🎯 Тейк-профит: `${data['take_profit']}`\n"
             f"🛡 Стоп-лосс: `${data['stop_loss']}`\n\n"
-            f"📋 *Подтверждения:*\n{reasons}\n\n"
+            f"📋 *Подтверждения:*\n{reasons}"
+            f"{news_line}\n\n"
             f"📈 RSI: `{data['rsi']}`\n\n"
             f"⚠️ Не является финансовым советом"
         )
+
+    news_line = f"{data.get('news_warning', '')}\n\n" if data.get("news_warning") else ""
     return (
         f"{header}"
         f"Направление: {data['direction']}\n"
-        f"Подтверждений: `{data['score']}` — нужно 4/5\n\n"
+        f"Подтверждений: `{data['score']}` — нужно минимум 4/5\n\n"
         f"💵 Цена: `${data['entry']}`\n"
         f"📈 RSI: `{data['rsi']}`\n\n"
-        f"⏳ {data['reasons'][0]}\n\n"
+        f"{news_line}"
+        f"⏳ Ждём чёткого сигнала...\n\n"
         f"⚠️ Не является финансовым советом"
     )
 
 # ================================================================
-# КОМАНДЫ ПОЛЬЗОВАТЕЛЯ
+# КОМАНДЫ БОТА
 # ================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    status = "💎 Premium" if is_premium(user.id) else "👤 Free"
+    u = update.effective_user
     await update.message.reply_text(
-        f"👋 Привет, {user.first_name}!\n"
-        f"Статус: {status}\n\n"
-        f"🧠 Анализирую рынок по *5 индикаторам*.\n"
+        f"👋 Привет, {u.first_name}!\n\n"
+        f"🤖 *AlphaX Trade* — твой ИИ-помощник для трейдинга.\n\n"
+        f"Анализирую рынок по *6 факторам:*\n"
+        f"📊 5 технических индикаторов\n"
+        f"📰 Анализ мировых новостей (CoinTelegraph, Reuters)\n\n"
         f"Сигнал только при *4/5 подтверждениях*.\n\n"
         f"📌 Команды:\n"
-        f"/signal — получить сигнал\n"
+        f"/signal — получить сигнал прямо сейчас\n"
         f"/subscribe — автосигналы каждые 4 часа\n"
-        f"/buy — Premium подписка\n"
-        f"/mystatus — мой статус\n"
-        f"/help — помощь",
+        f"/unsubscribe — отключить автосигналы\n"
+        f"/help — как работает бот",
         parse_mode="Markdown"
     )
 
-async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if is_premium(user.id):
-        await update.message.reply_text(
-            f"💎 *Premium активен*\n\nДо: `{get_expiry(user.id)}`",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            f"👤 *Free тариф*\n\nОформи Premium: /buy",
-            parse_mode="Markdown"
-        )
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Как работает AlphaX Trade:*\n\n"
+        "*5 технических индикаторов:*\n"
+        "1️⃣ RSI — перекупленность/перепроданность\n"
+        "2️⃣ MACD — направление импульса\n"
+        "3️⃣ Bollinger Bands — цена на краю канала\n"
+        "4️⃣ Тренд 4H — глобальное направление рынка\n"
+        "5️⃣ Объём — деньги подтверждают движение\n\n"
+        "*📰 Анализ новостей:*\n"
+        "Читаю CoinTelegraph, CoinDesk, Reuters.\n"
+        "Если новости совпадают с сигналом — усиливают его.\n"
+        "Если противоречат — предупреждаю тебя.\n\n"
+        "✅ *4/5* = Хороший сигнал\n"
+        "🔥 *5/5* = Сильный сигнал\n"
+        "⚪️ *3/5 и меньше* = Ждём\n\n"
+        "/signal — сигнал сейчас\n"
+        "/subscribe — автосигналы каждые 4ч\n"
+        "/unsubscribe — отключить\n\n"
+        "⚠️ Не является финансовым советом.",
+        parse_mode="Markdown"
+    )
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[
         InlineKeyboardButton("₿ BTC/USD", callback_data="sig_btc"),
-        InlineKeyboardButton("🥇 XAUUSD", callback_data="sig_gold"),
+        InlineKeyboardButton("🥇 XAUUSD",  callback_data="sig_gold"),
     ]]
-    await update.message.reply_text(
-        "Выбери актив для анализа:",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+    await update.message.reply_text("Выбери актив:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.message.chat_id
@@ -444,8 +376,9 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_subscriber(cid)
         await update.message.reply_text(
             "✅ *Автосигналы активированы!*\n\n"
-            "BTC и Золото каждые 4 часа.\n"
-            "Слабые сигналы пропускаю — только 4/5 и выше.\n\n"
+            "Каждые 4 часа анализирую BTC и Золото.\n"
+            "Слабые сигналы пропускаю — только 4/5 и выше.\n"
+            "Новости проверяю автоматически.\n\n"
             "Отключить: /unsubscribe",
             parse_mode="Markdown"
         )
@@ -454,201 +387,31 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.message.chat_id
     if cid in get_subscribers():
         remove_subscriber(cid)
-        await update.message.reply_text("❌ Автосигналы отключены. Вернуться: /subscribe")
+        await update.message.reply_text("❌ Автосигналы отключены.\nВернуться: /subscribe")
     else:
         await update.message.reply_text("Ты не был подписан.")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Команды:*\n\n"
-        "/signal — сигнал сейчас\n"
-        "/subscribe — автосигналы каждые 4ч\n"
-        "/unsubscribe — отключить\n"
-        "/buy — Premium подписка\n"
-        "/mystatus — мой статус\n\n"
-        "⚠️ Не является финансовым советом.",
-        parse_mode="Markdown"
-    )
-
-async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if is_premium(user.id):
-        await update.message.reply_text(
-            f"💎 Premium активен до `{get_expiry(user.id)}`!",
-            parse_mode="Markdown"
-        )
-        return
-    kb = [
-        [InlineKeyboardButton("⭐ Telegram Stars (~$9.9)", callback_data="pay_stars")],
-        [InlineKeyboardButton("💳 Kaspi (4 990 ₸)", callback_data="pay_kaspi")],
-    ]
-    await update.message.reply_text(
-        f"💎 *AlphaX Trade Premium — 30 дней*\n\n"
-        f"✅ Точки входа в каждой сделке\n"
-        f"✅ Тейк-профит и стоп-лосс\n"
-        f"✅ 5-индикаторный анализ\n"
-        f"✅ Автосигналы BTC + XAUUSD 24/7\n\n"
-        f"Выбери способ оплаты:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-# ================================================================
-# ОБРАБОТЧИК КНОПОК
-# ================================================================
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data in ("sig_btc", "sig_gold"):
-        await query.edit_message_text("🔍 Анализирую рынок по 5 индикаторам...")
-        try:
-            data = get_signal_btc() if query.data == "sig_btc" else get_signal_gold()
-            text = format_premium(data) if is_premium(query.from_user.id) else format_free(data)
-            await query.edit_message_text(text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Ошибка сигнала: {e}")
-            await query.edit_message_text(f"❌ Ошибка: {str(e)}")
-
-    elif query.data == "pay_stars":
-        await query.message.delete()
-        await context.bot.send_invoice(
-            chat_id=query.from_user.id,
-            title="AlphaX Trade Premium",
-            description=f"Полный доступ к сигналам на {PREMIUM_DAYS} дней",
-            payload="premium_30_days",
-            provider_token="",
-            currency="XTR",
-            prices=[LabeledPrice("Premium 30 дней", PREMIUM_STARS)]
-        )
-
-    elif query.data == "pay_kaspi":
-        user = query.from_user
-        context.user_data["waiting_kaspi"] = True
-        await query.edit_message_text(
-            f"💳 *Оплата через Kaspi*\n\n"
-            f"1️⃣ Открой Kaspi → Переводы\n"
-            f"2️⃣ Переведи `4 990 ₸` на номер:\n"
-            f"📱 `{KASPI_PHONE}` ({KASPI_NAME})\n"
-            f"3️⃣ В комментарии напиши свой ID:\n"
-            f"🆔 `{user.id}`\n"
-            f"4️⃣ Отправь скриншот сюда 👇\n\n"
-            f"⚡️ Открываем доступ за 15 минут",
-            parse_mode="Markdown"
-        )
-
-# ================================================================
-# TELEGRAM STARS
-# ================================================================
-
-async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    expiry_str = add_premium(user.id, PREMIUM_DAYS, method="telegram_stars")
-    logger.info(f"Stars оплата: {user.id} — до {expiry_str}")
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("🔍 Анализирую рынок + читаю новости, 10-15 сек...")
     try:
-        username = f"@{user.username}" if user.username else "без username"
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"💰 *Новая Stars оплата!*\n\n"
-                f"👤 {user.first_name} ({username})\n"
-                f"🆔 `{user.id}`\n"
-                f"До: {expiry_str}"
-            ),
-            parse_mode="Markdown"
-        )
+        fn   = _btc if q.data == "sig_btc" else _gold
+        data = await asyncio.to_thread(fn)
+        await q.edit_message_text(fmt(data), parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Не удалось уведомить админа: {e}")
-    await update.message.reply_text(
-        f"🎉 *Premium активирован!*\n\nДо: `{expiry_str}`\n\nПопробуй: /signal",
-        parse_mode="Markdown"
-    )
-
-# ================================================================
-# KASPI
-# ================================================================
-
-async def screenshot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("waiting_kaspi"):
-        return
-    context.user_data["waiting_kaspi"] = False
-    user = update.effective_user
-    username = f"@{user.username}" if user.username else "без username"
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"💳 *Kaspi оплата!*\n\n"
-                f"👤 {user.first_name} ({username})\n"
-                f"🆔 `{user.id}`\n\n"
-                f"Выдать доступ: `/approve {user.id}`"
-            ),
-            parse_mode="Markdown"
-        )
-        await context.bot.forward_message(
-            ADMIN_ID, update.message.chat_id, update.message.message_id
-        )
-        await update.message.reply_text("✅ Скриншот получен! Открываем доступ за 15 минут 🎉")
-        logger.info(f"Kaspi чек от {user.id} ({username})")
-    except Exception as e:
-        logger.error(f"Ошибка скриншота: {e}")
-        await update.message.reply_text("❌ Ошибка. Попробуй /buy ещё раз.")
-
-# ================================================================
-# КОМАНДЫ АДМИНИСТРАТОРА
-# ================================================================
-
-async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    if not context.args:
-        await update.message.reply_text("Использование: `/approve USER_ID [дней]`", parse_mode="Markdown")
-        return
-    try:
-        uid = int(context.args[0])
-        days = int(context.args[1]) if len(context.args) > 1 else PREMIUM_DAYS
-        expiry_str = add_premium(uid, days, method="kaspi")
-        try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text=f"🎉 *Premium активирован!*\n\nДо: `{expiry_str}`\n\nПопробуй: /signal",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Не смог уведомить {uid}: {e}")
-        await update.message.reply_text(
-            f"✅ Premium выдан `{uid}` до {expiry_str}", parse_mode="Markdown"
-        )
-        logger.info(f"Admin approve: {uid} на {days} дней")
-    except ValueError:
-        await update.message.reply_text("❌ Пример: `/approve 123456789`", parse_mode="Markdown")
-
-async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    if not context.args:
-        await update.message.reply_text("Использование: `/revoke USER_ID`", parse_mode="Markdown")
-        return
-    remove_premium(int(context.args[0]))
-    await update.message.reply_text(f"✅ Premium отозван у {context.args[0]}")
+        logger.error(f"Ошибка сигнала: {e}")
+        await q.edit_message_text(f"❌ Ошибка: {e}")
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    stats = get_stats()
-    text = (
-        f"📊 *Статистика*\n\n"
-        f"👥 Подписчиков: {stats['subs']}\n"
-        f"💎 Premium активных: {len(stats['premium'])}\n\n"
+    if update.effective_user.id != ADMIN_ID:
+        return
+    n = count_subscribers()
+    await update.message.reply_text(
+        f"📊 *Статистика AlphaX Trade*\n\n"
+        f"👥 Подписчиков на автосигналы: *{n}*",
+        parse_mode="Markdown"
     )
-    if stats["premium"]:
-        text += "*Premium пользователи:*\n"
-        for p in stats["premium"]:
-            text += f"• `{p['user_id']}` — {p['expiry_str']} ({p['days_left']}д) [{p['method']}]\n"
-    else:
-        text += "Нет активных Premium пользователей."
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 # ================================================================
 # АВТОСИГНАЛЫ
@@ -657,14 +420,15 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
     subs = get_subscribers()
     if not subs:
-        logger.info("Нет подписчиков"); return
+        logger.info("Нет подписчиков — пропускаем")
+        return
 
     logger.info(f"Автосигналы: {len(subs)} подписчиков")
     to_send = []
 
-    for name, func in [("BTC", get_signal_btc), ("Gold", get_signal_gold)]:
+    for name, fn in [("BTC", _btc), ("Gold", _gold)]:
         try:
-            data = func()
+            data = await asyncio.to_thread(fn)
             if data["direction"] != "⚪️ ЖДАТЬ":
                 to_send.append(data)
                 logger.info(f"{name}: {data['direction']} ({data['score']})")
@@ -674,14 +438,14 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка {name}: {e}")
 
     if not to_send:
-        logger.info("Нет сигналов — пропускаем"); return
+        logger.info("Нет сигналов — рассылка пропущена")
+        return
 
     dead = set()
     for cid in subs.copy():
-        for sd in to_send:
+        for d in to_send:
             try:
-                text = format_premium(sd, is_auto=True) if is_premium(cid) else format_free(sd)
-                await context.bot.send_message(cid, text, parse_mode="Markdown")
+                await context.bot.send_message(cid, fmt(d, is_auto=True), parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Ошибка отправки {cid}: {e}")
                 dead.add(cid)
@@ -696,26 +460,18 @@ def main():
     init_storage()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", signal_command))
-    app.add_handler(CommandHandler("subscribe", subscribe))
+    app.add_handler(CommandHandler("start",       start))
+    app.add_handler(CommandHandler("signal",      signal_command))
+    app.add_handler(CommandHandler("subscribe",   subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
-    app.add_handler(CommandHandler("buy", buy_command))
-    app.add_handler(CommandHandler("mystatus", mystatus))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CommandHandler("revoke", revoke))
-    app.add_handler(CommandHandler("users", users_command))
-
+    app.add_handler(CommandHandler("help",        help_command))
+    app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
 
     app.job_queue.run_repeating(send_auto_signals, interval=14400, first=10)
 
     mode = "PostgreSQL ☁️" if DATABASE_URL else "JSON (локально)"
-    print(f"✅ Бот запущен! Хранилище: {mode}")
+    print(f"✅ AlphaX Trade запущен! Хранилище: {mode}")
     logger.info(f"Бот запущен. Хранилище: {mode}")
     app.run_polling()
 
