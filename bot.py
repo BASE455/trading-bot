@@ -29,8 +29,33 @@ BOT_TOKEN    = os.getenv("BOT_TOKEN")
 ADMIN_ID     = int(os.getenv("ADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Скоринг: 5 технических индикаторов (1 балл каждый) + новости (2 балла)
+NEWS_WEIGHT = 2          # новости весят как 2 обычных индикатора
+MAX_SCORE   = 7          # 5 (техника) + 2 (новости)
+MIN_SCORE   = 5          # минимум для сигнала (~71% совпадений)
+
 # ================================================================
-# ХРАНИЛИЩЕ (только подписчики, без Premium)
+# АКТИВЫ — чтобы добавить новый, допиши одну строку сюда
+# ================================================================
+
+ASSETS = {
+    "btc":    {"ticker": "BTC-USD",  "name": "BTC/USD", "emoji": "₿",  "tp": 0.040,  "sl": 0.020,  "class": "crypto"},
+    "gold":   {"ticker": "GC=F",     "name": "XAUUSD",  "emoji": "🥇", "tp": 0.015,  "sl": 0.0075, "class": "gold"},
+    "eur":    {"ticker": "EURUSD=X", "name": "EUR/USD", "emoji": "💶", "tp": 0.008,  "sl": 0.004,  "class": "forex"},
+    "nasdaq": {"ticker": "^IXIC",    "name": "NASDAQ",  "emoji": "📈", "tp": 0.020,  "sl": 0.010,  "class": "stock"},
+    "aapl":   {"ticker": "AAPL",     "name": "AAPL",    "emoji": "🍎", "tp": 0.025,  "sl": 0.0125, "class": "stock"},
+    "tsla":   {"ticker": "TSLA",     "name": "TSLA",    "emoji": "🚗", "tp": 0.035,  "sl": 0.0175, "class": "stock"},
+}
+
+PERIOD_BY_CLASS = {
+    "crypto": "7d",
+    "gold":   "7d",
+    "forex":  "7d",
+    "stock":  "30d",   # акции торгуются ~6.5ч/день — нужно больше дней для EMA-50
+}
+
+# ================================================================
+# ХРАНИЛИЩЕ
 # ================================================================
 
 if DATABASE_URL:
@@ -94,39 +119,39 @@ else:
 # ================================================================
 
 _news_cache: dict = {}
-NEWS_TTL = 1800  # кэш 30 минут
+NEWS_TTL = 1800  # кэш на 30 минут
 
-BTC_FEEDS = [
-    "https://cointelegraph.com/rss",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-]
-GOLD_FEEDS = [
-    "https://www.kitco.com/rss/",
-    "https://feeds.reuters.com/reuters/businessNews",
-]
+FEEDS_BY_CLASS = {
+    "crypto": ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/"],
+    "gold":   ["https://www.kitco.com/rss/", "https://feeds.reuters.com/reuters/businessNews"],
+    "forex":  ["https://feeds.reuters.com/reuters/businessNews", "http://feeds.marketwatch.com/marketwatch/topstories/"],
+    "stock":  ["http://feeds.marketwatch.com/marketwatch/topstories/", "https://feeds.reuters.com/reuters/businessNews"],
+}
 
 BULLISH_WORDS = [
     "bull", "surge", "rally", "gain", "rise", "soar", "jump", "high",
     "breakout", "buy", "long", "positive", "adoption", "approval",
     "etf", "growth", "support", "recovery", "rebound", "record",
-    "boost", "strong", "milestone", "inflow"
+    "boost", "strong", "milestone", "inflow", "beat", "upgrade",
+    "outperform", "buyback",
 ]
 BEARISH_WORDS = [
     "bear", "crash", "drop", "fall", "plunge", "dump", "sell",
     "short", "negative", "ban", "hack", "fear", "panic",
     "warning", "risk", "concern", "weak", "loss", "decline",
-    "collapse", "trouble", "restrict", "regulation", "outflow"
+    "collapse", "trouble", "restrict", "regulation", "outflow",
+    "miss", "downgrade", "underperform", "layoffs", "recall",
 ]
 
-def _fetch_news(symbol: str) -> tuple[int, str]:
-    """Возвращает (score, текст): +1 бычьи, 0 нейтральные, -1 медвежьи."""
+def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str]:
+    """Возвращает (score, текст). score: +1 бычьи новости, -1 медвежьи, 0 нейтрально."""
     now = time.time()
     if symbol in _news_cache:
         ts, score, text = _news_cache[symbol]
         if now - ts < NEWS_TTL:
             return score, text
 
-    feeds = BTC_FEEDS if "BTC" in symbol else GOLD_FEEDS
+    feeds = FEEDS_BY_CLASS.get(asset_class, FEEDS_BY_CLASS["stock"])
     bull, bear = 0, 0
 
     for url in feeds:
@@ -183,13 +208,51 @@ def _score_technical(rsi, macd, macd_s, price, bbu, bbl, trend_bull, vol_ratio):
 
     return bs, ss, br, sr
 
-def _analyze(ticker_symbol: str, display_symbol: str, tp: float, sl: float) -> dict:
+def build_result(symbol, direction, score, price, tp_pct, sl_pct, rsi, reasons, news_text, conflicts):
+    if score == MAX_SCORE:
+        strength = "🔥 СИЛЬНЫЙ"
+    elif score == MAX_SCORE - 1:
+        strength = "💪 ОЧЕНЬ ХОРОШИЙ"
+    else:
+        strength = "✅ ХОРОШИЙ"
+
+    if direction == "LONG":
+        entry_dir   = "🟢 ПОКУПАЙ (LONG)"
+        take_profit = round(price * (1 + tp_pct), 2)
+        stop_loss   = round(price * (1 - sl_pct), 2)
+    else:
+        entry_dir   = "🔴 ПРОДАВАЙ (SHORT)"
+        take_profit = round(price * (1 - tp_pct), 2)
+        stop_loss   = round(price * (1 + sl_pct), 2)
+
+    return {
+        "symbol": symbol, "direction": entry_dir, "strength": strength,
+        "score": f"{score}/{MAX_SCORE}", "entry": round(price, 2),
+        "take_profit": take_profit, "stop_loss": stop_loss,
+        "rsi": rsi, "reasons": reasons,
+        "news_text": news_text, "news_conflicts": conflicts,
+    }
+
+def wait_result(symbol, score, price, rsi, news_text):
+    return {
+        "symbol": symbol, "direction": "⚪️ ЖДАТЬ", "strength": "—",
+        "score": f"{score}/{MAX_SCORE}", "entry": round(price, 2),
+        "take_profit": None, "stop_loss": None, "rsi": rsi,
+        "reasons": ["Недостаточно подтверждений — ждём лучшей точки входа"],
+        "news_text": news_text, "news_conflicts": False,
+    }
+
+def _analyze(asset_key: str) -> dict:
     """
-    Полный анализ: 5 технических индикаторов + новости.
-    Запускается в отдельном потоке (asyncio.to_thread).
+    Анализ актива: 5 технических индикаторов + новости (вес x2, максимум 7 баллов).
+    Выполняется в отдельном потоке через asyncio.to_thread — не блокирует бота.
     """
-    # --- Технический анализ ---
-    df = yf.Ticker(ticker_symbol).history(period="7d", interval="1h")
+    cfg = ASSETS[asset_key]
+    ticker_symbol, display_symbol = cfg["ticker"], cfg["name"]
+    tp, sl, asset_class = cfg["tp"], cfg["sl"], cfg["class"]
+    period = PERIOD_BY_CLASS.get(asset_class, "7d")
+
+    df = yf.Ticker(ticker_symbol).history(period=period, interval="1h")
     if df.empty:
         raise ValueError(f"Нет данных: {display_symbol}")
 
@@ -215,71 +278,21 @@ def _analyze(ticker_symbol: str, display_symbol: str, tp: float, sl: float) -> d
         p, float(last["bbu"]), float(last["bbl"]), trend, vr
     )
 
-    # --- Новости ---
-    news_score, news_text = _fetch_news(display_symbol)
+    news_score, news_text = _fetch_news(display_symbol, asset_class)
+    if news_score > 0:
+        bs += NEWS_WEIGHT
+        br.append("📰 Новости подтверждают рост")
+    elif news_score < 0:
+        ss += NEWS_WEIGHT
+        sr.append("📰 Новости подтверждают падение")
 
-    def _strength(sc: int) -> str:
-        if sc == 5: return "🔥 СИЛЬНЫЙ"
-        if sc >= 4: return "✅ ХОРОШИЙ"
-        return "—"
-
-    # --- Сборка результата ---
-    if bs >= 4:
-        # Новости подтверждают LONG → добавляем в подтверждения
-        if news_score > 0:
-            br.append(f"📰 Новостной фон: {news_text}")
-            news_warning = None
-        else:
-            news_warning = f"📰 Новостной фон: {news_text}"
-        return {
-            "symbol": display_symbol,
-            "direction": "🟢 ПОКУПАЙ (LONG)",
-            "strength": _strength(bs),
-            "score": f"{bs}/5",
-            "entry": round(p, 2),
-            "take_profit": round(p * (1 + tp), 2),
-            "stop_loss": round(p * (1 - sl), 2),
-            "rsi": rsi,
-            "reasons": br,
-            "news_warning": news_warning,
-        }
-
-    elif ss >= 4:
-        # Новости подтверждают SHORT → добавляем в подтверждения
-        if news_score < 0:
-            sr.append(f"📰 Новостной фон: {news_text}")
-            news_warning = None
-        else:
-            news_warning = f"📰 Новостной фон: {news_text}"
-        return {
-            "symbol": display_symbol,
-            "direction": "🔴 ПРОДАВАЙ (SHORT)",
-            "strength": _strength(ss),
-            "score": f"{ss}/5",
-            "entry": round(p, 2),
-            "take_profit": round(p * (1 - tp), 2),
-            "stop_loss": round(p * (1 + sl), 2),
-            "rsi": rsi,
-            "reasons": sr,
-            "news_warning": news_warning,
-        }
-
-    else:
-        return {
-            "symbol": display_symbol,
-            "direction": "⚪️ ЖДАТЬ",
-            "strength": "—",
-            "score": f"{max(bs, ss)}/5",
-            "entry": round(p, 2),
-            "take_profit": None,
-            "stop_loss": None,
-            "rsi": rsi,
-            "reasons": ["Недостаточно подтверждений — ждём лучшей точки входа"],
-            "news_warning": f"📰 Новостной фон: {news_text}",
-        }
-
-def _btc():  return _analyze("BTC-USD", "BTC/USD", 0.04,  0.02)
-def _gold(): return _analyze("GC=F",    "XAUUSD",  0.015, 0.0075)
+    if bs >= MIN_SCORE and bs > ss:
+        return build_result(display_symbol, "LONG", bs, p, tp, sl, rsi, br,
+                             news_text, conflicts=(news_score < 0))
+    if ss >= MIN_SCORE and ss > bs:
+        return build_result(display_symbol, "SHORT", ss, p, tp, sl, rsi, sr,
+                             news_text, conflicts=(news_score > 0))
+    return wait_result(display_symbol, max(bs, ss), p, rsi, news_text)
 
 # ================================================================
 # ФОРМАТИРОВАНИЕ
@@ -290,8 +303,11 @@ def fmt(data: dict, is_auto: bool = False) -> str:
     header = f"🔔 *Автосигнал {sym}*\n\n" if is_auto else f"📊 *Сигнал {sym}*\n\n"
 
     if data["take_profit"]:
-        reasons   = "\n".join(f"  ✅ {r}" for r in data["reasons"])
-        news_line = f"\n⚠️ *Осторожно:* {data['news_warning']}" if data.get("news_warning") else ""
+        reasons  = "\n".join(f"  ✅ {r}" for r in data["reasons"])
+        conflict = (
+            f"\n\n⚠️ *Осторожно:* новости против сигнала ({data['news_text']})"
+            if data["news_conflicts"] else ""
+        )
         return (
             f"{header}"
             f"Направление: {data['direction']}\n"
@@ -300,19 +316,18 @@ def fmt(data: dict, is_auto: bool = False) -> str:
             f"🎯 Тейк-профит: `${data['take_profit']}`\n"
             f"🛡 Стоп-лосс: `${data['stop_loss']}`\n\n"
             f"📋 *Подтверждения:*\n{reasons}"
-            f"{news_line}\n\n"
+            f"{conflict}\n\n"
             f"📈 RSI: `{data['rsi']}`\n\n"
             f"⚠️ Не является финансовым советом"
         )
 
-    news_line = f"{data.get('news_warning', '')}\n\n" if data.get("news_warning") else ""
     return (
         f"{header}"
         f"Направление: {data['direction']}\n"
-        f"Подтверждений: `{data['score']}` — нужно минимум 4/5\n\n"
+        f"Подтверждений: `{data['score']}` — нужно минимум {MIN_SCORE}/{MAX_SCORE}\n\n"
         f"💵 Цена: `${data['entry']}`\n"
         f"📈 RSI: `{data['rsi']}`\n\n"
-        f"{news_line}"
+        f"📰 Новостной фон: {data['news_text']}\n\n"
         f"⏳ Ждём чёткого сигнала...\n\n"
         f"⚠️ Не является финансовым советом"
     )
@@ -323,49 +338,52 @@ def fmt(data: dict, is_auto: bool = False) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    assets_list = ", ".join(f"{c['emoji']}{c['name']}" for c in ASSETS.values())
     await update.message.reply_text(
         f"👋 Привет, {u.first_name}!\n\n"
         f"🤖 *AlphaX Trade* — твой ИИ-помощник для трейдинга.\n\n"
-        f"Анализирую рынок по *6 факторам:*\n"
-        f"📊 5 технических индикаторов\n"
-        f"📰 Анализ мировых новостей (CoinTelegraph, Reuters)\n\n"
-        f"Сигнал только при *4/5 подтверждениях*.\n\n"
+        f"📊 Слежу за: {assets_list}\n\n"
+        f"Анализирую по *{MAX_SCORE} факторам*: 5 технических индикаторов "
+        f"+ новости (новости весят как 2 индикатора).\n"
+        f"Сигнал только при *{MIN_SCORE}/{MAX_SCORE}* подтверждениях.\n\n"
         f"📌 Команды:\n"
-        f"/signal — получить сигнал прямо сейчас\n"
-        f"/subscribe — автосигналы каждые 4 часа\n"
-        f"/unsubscribe — отключить автосигналы\n"
-        f"/help — как работает бот",
+        f"/signal — сигнал прямо сейчас\n"
+        f"/subscribe — автосигналы каждые 2.5 часа\n"
+        f"/unsubscribe — отключить\n"
+        f"/help — как это работает",
         parse_mode="Markdown"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    assets_list = "\n".join(f"{c['emoji']} {c['name']}" for c in ASSETS.values())
     await update.message.reply_text(
         "🤖 *Как работает AlphaX Trade:*\n\n"
-        "*5 технических индикаторов:*\n"
-        "1️⃣ RSI — перекупленность/перепроданность\n"
-        "2️⃣ MACD — направление импульса\n"
-        "3️⃣ Bollinger Bands — цена на краю канала\n"
-        "4️⃣ Тренд 4H — глобальное направление рынка\n"
-        "5️⃣ Объём — деньги подтверждают движение\n\n"
-        "*📰 Анализ новостей:*\n"
-        "Читаю CoinTelegraph, CoinDesk, Reuters.\n"
-        "Если новости совпадают с сигналом — усиливают его.\n"
-        "Если противоречат — предупреждаю тебя.\n\n"
-        "✅ *4/5* = Хороший сигнал\n"
-        "🔥 *5/5* = Сильный сигнал\n"
-        "⚪️ *3/5 и меньше* = Ждём\n\n"
+        f"*Активы:*\n{assets_list}\n\n"
+        "*5 технических индикаторов (1 балл каждый):*\n"
+        "1️⃣ RSI  2️⃣ MACD  3️⃣ Bollinger Bands\n"
+        "4️⃣ Тренд 4H  5️⃣ Объём\n\n"
+        "*📰 Новости (2 балла — весят как 2 индикатора):*\n"
+        "Читаю CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n"
+        "Новости могут добавить сигнал даже при слабой технике "
+        "или предупредить, если противоречат ей.\n\n"
+        f"✅ {MIN_SCORE}/{MAX_SCORE} = Хороший\n"
+        f"💪 {MAX_SCORE-1}/{MAX_SCORE} = Очень хороший\n"
+        f"🔥 {MAX_SCORE}/{MAX_SCORE} = Сильный\n\n"
         "/signal — сигнал сейчас\n"
-        "/subscribe — автосигналы каждые 4ч\n"
+        "/subscribe — автосигналы каждые 2.5ч\n"
         "/unsubscribe — отключить\n\n"
+        "⚠️ Акции и NASDAQ обновляются только в часы торгов биржи "
+        "(будни, US-время). Крипта и золото — почти круглосуточно.\n\n"
         "⚠️ Не является финансовым советом.",
         parse_mode="Markdown"
     )
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[
-        InlineKeyboardButton("₿ BTC/USD", callback_data="sig_btc"),
-        InlineKeyboardButton("🥇 XAUUSD",  callback_data="sig_gold"),
-    ]]
+    buttons = [
+        InlineKeyboardButton(f"{cfg['emoji']} {cfg['name']}", callback_data=f"sig_{key}")
+        for key, cfg in ASSETS.items()
+    ]
+    kb = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     await update.message.reply_text("Выбери актив:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,8 +394,8 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_subscriber(cid)
         await update.message.reply_text(
             "✅ *Автосигналы активированы!*\n\n"
-            "Каждые 4 часа анализирую BTC и Золото.\n"
-            "Слабые сигналы пропускаю — только 4/5 и выше.\n"
+            "Каждые 2.5 часа анализирую все активы.\n"
+            "Слабые сигналы пропускаю.\n"
             "Новости проверяю автоматически.\n\n"
             "Отключить: /unsubscribe",
             parse_mode="Markdown"
@@ -394,13 +412,18 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    if not q.data.startswith("sig_"):
+        return
+    asset_key = q.data.removeprefix("sig_")
+    if asset_key not in ASSETS:
+        return
+
     await q.edit_message_text("🔍 Анализирую рынок + читаю новости, 10-15 сек...")
     try:
-        fn   = _btc if q.data == "sig_btc" else _gold
-        data = await asyncio.to_thread(fn)
+        data = await asyncio.to_thread(_analyze, asset_key)
         await q.edit_message_text(fmt(data), parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Ошибка сигнала: {e}")
+        logger.error(f"Ошибка сигнала {asset_key}: {e}")
         await q.edit_message_text(f"❌ Ошибка: {e}")
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -409,7 +432,8 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = count_subscribers()
     await update.message.reply_text(
         f"📊 *Статистика AlphaX Trade*\n\n"
-        f"👥 Подписчиков на автосигналы: *{n}*",
+        f"👥 Подписчиков: *{n}*\n"
+        f"📈 Активов в анализе: *{len(ASSETS)}*",
         parse_mode="Markdown"
     )
 
@@ -423,19 +447,20 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Нет подписчиков — пропускаем")
         return
 
-    logger.info(f"Автосигналы: {len(subs)} подписчиков")
+    logger.info(f"Автосигналы: {len(subs)} подписчиков, {len(ASSETS)} активов")
     to_send = []
 
-    for name, fn in [("BTC", _btc), ("Gold", _gold)]:
+    for key, cfg in ASSETS.items():
         try:
-            data = await asyncio.to_thread(fn)
+            data = await asyncio.to_thread(_analyze, key)
             if data["direction"] != "⚪️ ЖДАТЬ":
                 to_send.append(data)
-                logger.info(f"{name}: {data['direction']} ({data['score']})")
+                logger.info(f"{cfg['name']}: {data['direction']} ({data['score']})")
             else:
-                logger.info(f"{name}: ЖДАТЬ — пропущен")
+                logger.info(f"{cfg['name']}: ЖДАТЬ — пропущен")
         except Exception as e:
-            logger.error(f"Ошибка {name}: {e}")
+            logger.error(f"Ошибка {cfg['name']}: {e}")
+        await asyncio.sleep(1)  # бережём Yahoo Finance от перегрузки запросами
 
     if not to_send:
         logger.info("Нет сигналов — рассылка пропущена")
@@ -468,11 +493,11 @@ def main():
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    app.job_queue.run_repeating(send_auto_signals, interval=14400, first=10)
+    app.job_queue.run_repeating(send_auto_signals, interval=9000, first=10)  # 2.5 часа
 
     mode = "PostgreSQL ☁️" if DATABASE_URL else "JSON (локально)"
-    print(f"✅ AlphaX Trade запущен! Хранилище: {mode}")
-    logger.info(f"Бот запущен. Хранилище: {mode}")
+    print(f"✅ AlphaX Trade запущен! Активов: {len(ASSETS)}. Хранилище: {mode}")
+    logger.info(f"Бот запущен. Активов: {len(ASSETS)}. Хранилище: {mode}")
     app.run_polling()
 
 if __name__ == "__main__":
