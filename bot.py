@@ -29,13 +29,12 @@ BOT_TOKEN    = os.getenv("BOT_TOKEN")
 ADMIN_ID     = int(os.getenv("ADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Скоринг: 5 технических индикаторов (1 балл каждый) + новости (2 балла)
-NEWS_WEIGHT = 2          # новости весят как 2 обычных индикатора
-MAX_SCORE   = 7          # 5 (техника) + 2 (новости)
-MIN_SCORE   = 5          # минимум для сигнала (~71% совпадений)
+NEWS_WEIGHT = 2   # новости весят как 2 обычных индикатора
+MAX_SCORE   = 7   # 5 (техника) + 2 (новости)
+MIN_SCORE   = 5   # минимум для сигнала
 
 # ================================================================
-# АКТИВЫ — чтобы добавить новый, допиши одну строку сюда
+# АКТИВЫ
 # ================================================================
 
 ASSETS = {
@@ -51,7 +50,7 @@ PERIOD_BY_CLASS = {
     "crypto": "7d",
     "gold":   "7d",
     "forex":  "7d",
-    "stock":  "30d",   # акции торгуются ~6.5ч/день — нужно больше дней для EMA-50
+    "stock":  "30d",
 }
 
 # ================================================================
@@ -144,7 +143,12 @@ BEARISH_WORDS = [
 ]
 
 def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str]:
-    """Возвращает (score, текст). score: +1 бычьи новости, -1 медвежьи, 0 нейтрально."""
+    """
+    Возвращает (score, текст).
+    score: +1 бычьи слова перевешивают, -1 медвежьи перевешивают, 0 нейтрально.
+    Числа в тексте — это подсчёт КЛЮЧЕВЫХ СЛОВ в заголовках, а не готовые
+    подтверждения из шкалы 0-7 (не путать одно с другим).
+    """
     now = time.time()
     if symbol in _news_cache:
         ts, score, text = _news_cache[symbol]
@@ -165,11 +169,11 @@ def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str]:
             logger.warning(f"RSS ошибка {url}: {e}")
 
     if bull > bear:
-        score, text = 1, f"Позитивный (🟢{bull} бычьих / 🔴{bear} медвежьих)"
+        score, text = 1, f"🟢 Бычий (в заголовках: {bull} слов за рост / {bear} за падение)"
     elif bear > bull:
-        score, text = -1, f"Негативный (🔴{bear} медвежьих / 🟢{bull} бычьих)"
+        score, text = -1, f"🔴 Медвежий (в заголовках: {bear} слов за падение / {bull} за рост)"
     else:
-        score, text = 0, "Нейтральный"
+        score, text = 0, "⚪ Нейтральный"
 
     _news_cache[symbol] = (now, score, text)
     logger.info(f"Новости {symbol}: {text}")
@@ -188,30 +192,56 @@ def _get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     return bb[u], bb[l]
 
 def _score_technical(rsi, macd, macd_s, price, bbu, bbl, trend_bull, vol_ratio):
+    """
+    Каждый индикатор даёт 1 балл ЛИБО покупке (bs), ЛИБО продаже (ss).
+    Если индикатор нейтрален (например RSI между 30 и 70) — он не даёт
+    ничего никому, поэтому bs + ss не всегда равно 5.
+    """
     bs, ss, br, sr = 0, 0, [], []
 
-    if rsi < 30:   bs += 1; br.append(f"RSI перепродан ({rsi})")
-    elif rsi > 70: ss += 1; sr.append(f"RSI перекуплен ({rsi})")
+    if rsi < 30:
+        bs += 1
+        br.append(f"RSI = {rsi} (ниже 30 — актив перепродан, часто следует разворот вверх)")
+    elif rsi > 70:
+        ss += 1
+        sr.append(f"RSI = {rsi} (выше 70 — актив перекуплен, часто следует разворот вниз)")
 
-    if macd > macd_s: bs += 1; br.append("MACD бычий импульс")
-    else:             ss += 1; sr.append("MACD медвежий импульс")
+    if macd > macd_s:
+        bs += 1
+        br.append("MACD выше сигнальной линии — восходящий импульс набирает силу")
+    else:
+        ss += 1
+        sr.append("MACD ниже сигнальной линии — нисходящий импульс набирает силу")
 
-    if price <= bbl * 1.005:   bs += 1; br.append("Цена у нижней BB (зона покупки)")
-    elif price >= bbu * 0.995: ss += 1; sr.append("Цена у верхней BB (зона продажи)")
+    if price <= bbl * 1.005:
+        bs += 1
+        br.append("Цена у нижней границы Bollinger Bands — статистически «дёшево», вероятен отскок вверх")
+    elif price >= bbu * 0.995:
+        ss += 1
+        sr.append("Цена у верхней границы Bollinger Bands — статистически «дорого», вероятен откат вниз")
 
-    if trend_bull: bs += 1; br.append("4H тренд восходящий (EMA20 > EMA50)")
-    else:          ss += 1; sr.append("4H тренд нисходящий (EMA20 < EMA50)")
+    if trend_bull:
+        bs += 1
+        br.append("Старший таймфрейм (4H): EMA20 выше EMA50 — общий тренд вверх")
+    else:
+        ss += 1
+        sr.append("Старший таймфрейм (4H): EMA20 ниже EMA50 — общий тренд вниз")
 
     if vol_ratio >= 1.5:
-        if bs >= ss: bs += 1; br.append(f"Объём подтверждает рост (×{round(vol_ratio,1)})")
-        else:        ss += 1; sr.append(f"Объём подтверждает падение (×{round(vol_ratio,1)})")
+        if bs >= ss:
+            bs += 1
+            br.append(f"Объём торгов ×{round(vol_ratio,1)} от среднего — крупные игроки заходят в рост")
+        else:
+            ss += 1
+            sr.append(f"Объём торгов ×{round(vol_ratio,1)} от среднего — крупные игроки продают")
 
     return bs, ss, br, sr
 
-def build_result(symbol, direction, score, price, tp_pct, sl_pct, rsi, reasons, news_text, conflicts):
-    if score == MAX_SCORE:
+def build_result(symbol, direction, total_score, tech_score, price, tp_pct, sl_pct,
+                  rsi, reasons, news_text, conflicts, news_helped):
+    if total_score == MAX_SCORE:
         strength = "🔥 СИЛЬНЫЙ"
-    elif score == MAX_SCORE - 1:
+    elif total_score == MAX_SCORE - 1:
         strength = "💪 ОЧЕНЬ ХОРОШИЙ"
     else:
         strength = "✅ ХОРОШИЙ"
@@ -227,19 +257,23 @@ def build_result(symbol, direction, score, price, tp_pct, sl_pct, rsi, reasons, 
 
     return {
         "symbol": symbol, "direction": entry_dir, "strength": strength,
-        "score": f"{score}/{MAX_SCORE}", "entry": round(price, 2),
+        "score": f"{total_score}/{MAX_SCORE}", "tech_score": f"{tech_score}/5",
+        "entry": round(price, 2),
         "take_profit": take_profit, "stop_loss": stop_loss,
         "rsi": rsi, "reasons": reasons,
         "news_text": news_text, "news_conflicts": conflicts,
+        "news_helped": news_helped,
     }
 
-def wait_result(symbol, score, price, rsi, news_text):
+def wait_result(symbol, tech_score, total_score, price, rsi, news_text, news_helped):
     return {
         "symbol": symbol, "direction": "⚪️ ЖДАТЬ", "strength": "—",
-        "score": f"{score}/{MAX_SCORE}", "entry": round(price, 2),
+        "score": f"{total_score}/{MAX_SCORE}", "tech_score": f"{tech_score}/5",
+        "entry": round(price, 2),
         "take_profit": None, "stop_loss": None, "rsi": rsi,
         "reasons": ["Недостаточно подтверждений — ждём лучшей точки входа"],
         "news_text": news_text, "news_conflicts": False,
+        "news_helped": news_helped,
     }
 
 def _analyze(asset_key: str) -> dict:
@@ -277,22 +311,30 @@ def _analyze(asset_key: str) -> dict:
         rsi, float(last["macd"]), float(last["ms"]),
         p, float(last["bbu"]), float(last["bbl"]), trend, vr
     )
+    tech_bs, tech_ss = bs, ss  # технический счёт ДО добавления новостей
 
     news_score, news_text = _fetch_news(display_symbol, asset_class)
     if news_score > 0:
         bs += NEWS_WEIGHT
-        br.append("📰 Новости подтверждают рост")
+        br.append(f"Новости: {news_text} — усиливают сигнал на покупку")
     elif news_score < 0:
         ss += NEWS_WEIGHT
-        sr.append("📰 Новости подтверждают падение")
+        sr.append(f"Новости: {news_text} — усиливают сигнал на продажу")
 
     if bs >= MIN_SCORE and bs > ss:
-        return build_result(display_symbol, "LONG", bs, p, tp, sl, rsi, br,
-                             news_text, conflicts=(news_score < 0))
+        return build_result(display_symbol, "LONG", bs, tech_bs, p, tp, sl, rsi, br,
+                             news_text, conflicts=(news_score < 0),
+                             news_helped=(news_score > 0))
     if ss >= MIN_SCORE and ss > bs:
-        return build_result(display_symbol, "SHORT", ss, p, tp, sl, rsi, sr,
-                             news_text, conflicts=(news_score > 0))
-    return wait_result(display_symbol, max(bs, ss), p, rsi, news_text)
+        return build_result(display_symbol, "SHORT", ss, tech_ss, p, tp, sl, rsi, sr,
+                             news_text, conflicts=(news_score > 0),
+                             news_helped=(news_score < 0))
+
+    if bs >= ss:
+        return wait_result(display_symbol, tech_bs, bs, p, rsi, news_text,
+                            news_helped=(news_score > 0))
+    return wait_result(display_symbol, tech_ss, ss, p, rsi, news_text,
+                        news_helped=(news_score < 0))
 
 # ================================================================
 # ФОРМАТИРОВАНИЕ
@@ -302,8 +344,13 @@ def fmt(data: dict, is_auto: bool = False) -> str:
     sym    = data["symbol"]
     header = f"🔔 *Автосигнал {sym}*\n\n" if is_auto else f"📊 *Сигнал {sym}*\n\n"
 
+    if data["news_helped"]:
+        score_line = f"техника {data['tech_score']} + новости 📰 = *{data['score']}*"
+    else:
+        score_line = f"техника {data['tech_score']} = *{data['score']}* (новости не в счёт)"
+
     if data["take_profit"]:
-        reasons  = "\n".join(f"  ✅ {r}" for r in data["reasons"])
+        reasons  = "\n".join(f"{i+1}. {r}" for i, r in enumerate(data["reasons"]))
         conflict = (
             f"\n\n⚠️ *Осторожно:* новости против сигнала ({data['news_text']})"
             if data["news_conflicts"] else ""
@@ -311,11 +358,11 @@ def fmt(data: dict, is_auto: bool = False) -> str:
         return (
             f"{header}"
             f"Направление: {data['direction']}\n"
-            f"Сила: {data['strength']} `({data['score']})`\n\n"
+            f"Сила: {data['strength']} — {score_line}\n\n"
             f"📍 Точка входа: `${data['entry']}`\n"
             f"🎯 Тейк-профит: `${data['take_profit']}`\n"
             f"🛡 Стоп-лосс: `${data['stop_loss']}`\n\n"
-            f"📋 *Подтверждения:*\n{reasons}"
+            f"📋 *Почему этот сигнал:*\n{reasons}"
             f"{conflict}\n\n"
             f"📈 RSI: `{data['rsi']}`\n\n"
             f"⚠️ Не является финансовым советом"
@@ -324,10 +371,10 @@ def fmt(data: dict, is_auto: bool = False) -> str:
     return (
         f"{header}"
         f"Направление: {data['direction']}\n"
-        f"Подтверждений: `{data['score']}` — нужно минимум {MIN_SCORE}/{MAX_SCORE}\n\n"
+        f"Подтверждений: {score_line} — нужно минимум {MIN_SCORE}/{MAX_SCORE}\n\n"
         f"💵 Цена: `${data['entry']}`\n"
         f"📈 RSI: `{data['rsi']}`\n\n"
-        f"📰 Новостной фон: {data['news_text']}\n\n"
+        f"📰 Новости: {data['news_text']}\n\n"
         f"⏳ Ждём чёткого сигнала...\n\n"
         f"⚠️ Не является финансовым советом"
     )
@@ -344,8 +391,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 *AlphaX Trade* — твой ИИ-помощник для трейдинга.\n\n"
         f"📊 Слежу за: {assets_list}\n\n"
         f"Анализирую по *{MAX_SCORE} факторам*: 5 технических индикаторов "
-        f"+ новости (новости весят как 2 индикатора).\n"
+        f"+ новости (весят как 2 индикатора).\n"
         f"Сигнал только при *{MIN_SCORE}/{MAX_SCORE}* подтверждениях.\n\n"
+        f"Каждый сигнал объясняю по пунктам — почему он сработал.\n\n"
         f"📌 Команды:\n"
         f"/signal — сигнал прямо сейчас\n"
         f"/subscribe — автосигналы каждые 2.5 часа\n"
@@ -360,13 +408,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Как работает AlphaX Trade:*\n\n"
         f"*Активы:*\n{assets_list}\n\n"
         "*5 технических индикаторов (1 балл каждый):*\n"
-        "1️⃣ RSI  2️⃣ MACD  3️⃣ Bollinger Bands\n"
-        "4️⃣ Тренд 4H  5️⃣ Объём\n\n"
-        "*📰 Новости (2 балла — весят как 2 индикатора):*\n"
+        "1. RSI — перекупленность/перепроданность\n"
+        "2. MACD — направление импульса\n"
+        "3. Bollinger Bands — цена на краю канала\n"
+        "4. Тренд 4H — глобальное направление рынка\n"
+        "5. Объём — деньги подтверждают движение\n\n"
+        "*📰 Новости (до 2 баллов):*\n"
         "Читаю CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n"
-        "Новости могут добавить сигнал даже при слабой технике "
-        "или предупредить, если противоречат ей.\n\n"
-        f"✅ {MIN_SCORE}/{MAX_SCORE} = Хороший\n"
+        "Если технических подтверждений уже 3-4 и новости совпадают по "
+        "направлению — этого хватит для сигнала, все 5 технических ждать не нужно.\n\n"
+        "⚠️ *Важно:* «Медвежий» сигнал — не «плохо», это направление рынка вниз. "
+        "Бот одинаково даёт сигналы и на ПОКУПКУ (LONG), и на ПРОДАЖУ (SHORT). "
+        "Цифры вида «5 слов за падение» в новостях — это подсчёт ключевых слов "
+        "в заголовках, а не готовые баллы из шкалы 0-7.\n\n"
+        f"✅ {MIN_SCORE}/{MAX_SCORE} = Хороший сигнал\n"
         f"💪 {MAX_SCORE-1}/{MAX_SCORE} = Очень хороший\n"
         f"🔥 {MAX_SCORE}/{MAX_SCORE} = Сильный\n\n"
         "/signal — сигнал сейчас\n"
@@ -460,7 +515,7 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"{cfg['name']}: ЖДАТЬ — пропущен")
         except Exception as e:
             logger.error(f"Ошибка {cfg['name']}: {e}")
-        await asyncio.sleep(1)  # бережём Yahoo Finance от перегрузки запросами
+        await asyncio.sleep(1)
 
     if not to_send:
         logger.info("Нет сигналов — рассылка пропущена")
@@ -493,7 +548,7 @@ def main():
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    app.job_queue.run_repeating(send_auto_signals, interval=9000, first=10)  # 2.5 часа
+    app.job_queue.run_repeating(send_auto_signals, interval=9000, first=10)
 
     mode = "PostgreSQL ☁️" if DATABASE_URL else "JSON (локально)"
     print(f"✅ AlphaX Trade запущен! Активов: {len(ASSETS)}. Хранилище: {mode}")
