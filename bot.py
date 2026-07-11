@@ -39,9 +39,11 @@ MIN_SCORE   = 5   # минимум для сигнала
 
 ASSETS = {
     "btc":    {"ticker": "BTC-USD",  "name": "BTC/USD", "emoji": "₿",  "tp": 0.040,  "sl": 0.020,  "class": "crypto"},
+    "eth":    {"ticker": "ETH-USD",  "name": "ETH/USD", "emoji": "Ξ",  "tp": 0.040,  "sl": 0.020,  "class": "crypto"},
     "gold":   {"ticker": "GC=F",     "name": "XAUUSD",  "emoji": "🥇", "tp": 0.015,  "sl": 0.0075, "class": "gold"},
     "eur":    {"ticker": "EURUSD=X", "name": "EUR/USD", "emoji": "💶", "tp": 0.008,  "sl": 0.004,  "class": "forex"},
     "nasdaq": {"ticker": "^IXIC",    "name": "NASDAQ",  "emoji": "📈", "tp": 0.020,  "sl": 0.010,  "class": "stock"},
+    "sp500":  {"ticker": "^GSPC",    "name": "S&P 500", "emoji": "🏛", "tp": 0.020,  "sl": 0.010,  "class": "stock"},
     "aapl":   {"ticker": "AAPL",     "name": "AAPL",    "emoji": "🍎", "tp": 0.025,  "sl": 0.0125, "class": "stock"},
     "tsla":   {"ticker": "TSLA",     "name": "TSLA",    "emoji": "🚗", "tp": 0.035,  "sl": 0.0175, "class": "stock"},
 }
@@ -54,7 +56,7 @@ PERIOD_BY_CLASS = {
 }
 
 # ================================================================
-# ХРАНИЛИЩЕ
+# ХРАНИЛИЩЕ (подписчики + язык пользователя)
 # ================================================================
 
 if DATABASE_URL:
@@ -66,9 +68,13 @@ if DATABASE_URL:
     def init_storage():
         with _conn() as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "CREATE TABLE IF NOT EXISTS subscribers (chat_id BIGINT PRIMARY KEY);"
-                )
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS subscribers (chat_id BIGINT PRIMARY KEY);
+                    CREATE TABLE IF NOT EXISTS user_lang (
+                        chat_id BIGINT PRIMARY KEY,
+                        lang TEXT NOT NULL DEFAULT 'ru'
+                    );
+                """)
             c.commit()
         logger.info("PostgreSQL инициализирован")
 
@@ -99,22 +105,296 @@ if DATABASE_URL:
                 cur.execute("SELECT COUNT(*) FROM subscribers")
                 return cur.fetchone()[0]
 
+    def get_language(chat_id: int):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT lang FROM user_lang WHERE chat_id=%s", (chat_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    def set_language(chat_id: int, lang: str):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO user_lang (chat_id, lang) VALUES (%s, %s)
+                    ON CONFLICT (chat_id) DO UPDATE SET lang = EXCLUDED.lang
+                """, (chat_id, lang))
+            c.commit()
+
 else:
     SUBS_FILE = "subscribers.json"
+    LANG_FILE = "languages.json"
 
     def init_storage(): pass
 
-    def _load_s(): return json.load(open(SUBS_FILE)) if os.path.exists(SUBS_FILE) else []
-    def _save_s(d):
-        with open(SUBS_FILE, "w") as f: json.dump(d, f)
+    def _load_j(f, default):
+        return json.load(open(f)) if os.path.exists(f) else default
 
-    def get_subscribers() -> set: return set(_load_s())
-    def add_subscriber(cid: int): s = get_subscribers(); s.add(cid); _save_s(list(s))
-    def remove_subscriber(cid: int): s = get_subscribers(); s.discard(cid); _save_s(list(s))
+    def _save_j(f, d):
+        with open(f, "w") as fp:
+            json.dump(d, fp, ensure_ascii=False, indent=2)
+
+    def get_subscribers() -> set: return set(_load_j(SUBS_FILE, []))
+    def add_subscriber(cid: int): s = get_subscribers(); s.add(cid); _save_j(SUBS_FILE, list(s))
+    def remove_subscriber(cid: int): s = get_subscribers(); s.discard(cid); _save_j(SUBS_FILE, list(s))
     def count_subscribers() -> int: return len(get_subscribers())
 
+    def get_language(chat_id: int):
+        return _load_j(LANG_FILE, {}).get(str(chat_id))
+
+    def set_language(chat_id: int, lang: str):
+        d = _load_j(LANG_FILE, {})
+        d[str(chat_id)] = lang
+        _save_j(LANG_FILE, d)
+
 # ================================================================
-# АНАЛИЗ НОВОСТЕЙ (RSS + ключевые слова)
+# ТЕКСТЫ RU / EN
+# ================================================================
+
+LANG = {
+    "ru": {
+        "choose_language": "🌐 Выбери язык / Choose language:",
+        "btn_ru": "🇷🇺 Русский",
+        "btn_en": "🇺🇸 English",
+        "language_set": "✅ Язык установлен: Русский",
+
+        "start": (
+            "👋 Привет, {name}!\n\n"
+            "🤖 *AlphaX Trade* — твой ИИ-помощник для трейдинга.\n\n"
+            "📊 Слежу за: {assets_list}\n\n"
+            "Анализирую по *{max_score} факторам*: 5 технических индикаторов "
+            "+ новости (весят как 2 индикатора).\n"
+            "Сигнал только при *{min_score}/{max_score}* подтверждениях.\n\n"
+            "Каждый сигнал объясняю по пунктам и указываю время самих рыночных данных.\n\n"
+            "📌 Команды:\n"
+            "/signal — сигнал прямо сейчас\n"
+            "/subscribe — автосигналы каждые 2.5 часа\n"
+            "/unsubscribe — отключить\n"
+            "/language — сменить язык\n"
+            "/help — как это работает"
+        ),
+
+        "help": (
+            "🤖 *Как работает AlphaX Trade:*\n\n"
+            "*Активы:*\n{assets_list}\n\n"
+            "*5 технических индикаторов (1 балл каждый):*\n"
+            "1. RSI — перекупленность/перепроданность\n"
+            "2. MACD — направление импульса\n"
+            "3. Bollinger Bands — цена на краю канала\n"
+            "4. Тренд 4H — глобальное направление рынка\n"
+            "5. Объём — деньги подтверждают движение\n\n"
+            "*📰 Новости (до 2 баллов):*\n"
+            "Читаю CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n"
+            "Если технических подтверждений уже 3-4 и новости совпадают по "
+            "направлению — этого хватит для сигнала, все 5 технических ждать не нужно.\n\n"
+            "🕐 Каждый сигнал показывает время самих рыночных данных — с их родным "
+            "смещением UTC (например UTC-4), а не время нашего сервера. Данные — "
+            "с Yahoo Finance. Если время в самом Telegram выглядит иначе — это просто "
+            "часовой пояс твоего телефона, ориентируйся на время внутри сообщения.\n\n"
+            "⚠️ *Важно:* «медвежий» сигнал — не «плохо», это просто направление рынка вниз. "
+            "Бот одинаково даёт сигналы и на ПОКУПКУ (LONG), и на ПРОДАЖУ (SHORT).\n\n"
+            "✅ {min_score}/{max_score} = Хороший сигнал\n"
+            "💪 {near_max}/{max_score} = Очень хороший\n"
+            "🔥 {max_score}/{max_score} = Сильный\n\n"
+            "/signal — сигнал сейчас\n"
+            "/subscribe — автосигналы каждые 2.5ч\n"
+            "/unsubscribe — отключить\n"
+            "/language — сменить язык\n\n"
+            "⚠️ Акции, NASDAQ и S&P 500 обновляются только в часы торгов биржи "
+            "(будни, US-время). Крипта и золото — почти круглосуточно.\n\n"
+            "⚠️ Не является финансовым советом."
+        ),
+
+        "choose_asset": "Выбери актив:",
+        "analyzing": "🔍 Анализирую рынок + читаю новости, 10-15 сек...",
+        "error": "❌ Ошибка: {error}",
+
+        "sub_already": "✅ Ты уже подписан на автосигналы!",
+        "sub_activated": (
+            "✅ *Автосигналы активированы!*\n\n"
+            "Каждые 2.5 часа анализирую все активы.\n"
+            "Слабые сигналы пропускаю.\n"
+            "Новости проверяю автоматически.\n\n"
+            "Отключить: /unsubscribe"
+        ),
+        "unsub_done": "❌ Автосигналы отключены.\nВернуться: /subscribe",
+        "unsub_none": "Ты не был подписан.",
+
+        "header_signal": "📊 *Сигнал {symbol}*\n\n",
+        "header_auto": "🔔 *Автосигнал {symbol}*\n\n",
+
+        "dir_buy": "🟢 ПОКУПАЙ (LONG)",
+        "dir_sell": "🔴 ПРОДАВАЙ (SHORT)",
+        "dir_wait": "⚪️ ЖДАТЬ",
+
+        "str_strong": "🔥 СИЛЬНЫЙ",
+        "str_verygood": "💪 ОЧЕНЬ ХОРОШИЙ",
+        "str_good": "✅ ХОРОШИЙ",
+        "str_dash": "—",
+
+        "lbl_direction": "Направление",
+        "lbl_strength": "Сила",
+        "lbl_entry": "📍 Точка входа",
+        "lbl_tp": "🎯 Тейк-профит",
+        "lbl_sl": "🛡 Стоп-лосс",
+        "lbl_reasons": "📋 *Почему этот сигнал:*",
+        "lbl_rsi": "📈 RSI",
+        "lbl_price": "💵 Цена",
+        "lbl_confirmations": "Подтверждений",
+        "lbl_news": "📰 Новости",
+        "lbl_waiting": "⏳ Ждём чёткого сигнала...",
+        "lbl_disclaimer": "⚠️ Не является финансовым советом",
+        "lbl_signal_time": "🕐 Время котировки: {time}",
+
+        "score_combined": "техника {tech}/5 + новости 📰 = *{total}/7*",
+        "score_tech_only": "техника {tech}/5 = *{total}/7* (новости не в счёт)",
+        "need_min": "нужно минимум {min_score}/{max_score}",
+
+        "conflict_warning": "\n\n⚠️ *Осторожно:* новости против сигнала ({news_text})",
+
+        "reason_rsi_oversold": "RSI = {rsi} (ниже 30 — актив перепродан, часто следует разворот вверх)",
+        "reason_rsi_overbought": "RSI = {rsi} (выше 70 — актив перекуплен, часто следует разворот вниз)",
+        "reason_macd_bull": "MACD выше сигнальной линии — восходящий импульс набирает силу",
+        "reason_macd_bear": "MACD ниже сигнальной линии — нисходящий импульс набирает силу",
+        "reason_bb_lower": "Цена у нижней границы Bollinger Bands — статистически «дёшево», вероятен отскок вверх",
+        "reason_bb_upper": "Цена у верхней границы Bollinger Bands — статистически «дорого», вероятен откат вниз",
+        "reason_trend_up": "Старший таймфрейм (4H): EMA20 выше EMA50 — общий тренд вверх",
+        "reason_trend_down": "Старший таймфрейм (4H): EMA20 ниже EMA50 — общий тренд вниз",
+        "reason_vol_bull": "Объём торгов ×{ratio} от среднего — крупные игроки заходят в рост",
+        "reason_vol_bear": "Объём торгов ×{ratio} от среднего — крупные игроки продают",
+        "reason_news_buy": "Новости: {news_text} — усиливают сигнал на покупку",
+        "reason_news_sell": "Новости: {news_text} — усиливают сигнал на продажу",
+
+        "news_bullish": "🟢 Бычий (в заголовках: {bull} слов за рост / {bear} за падение)",
+        "news_bearish": "🔴 Медвежий (в заголовках: {bear} слов за падение / {bull} за рост)",
+        "news_neutral": "⚪ Нейтральный",
+    },
+    "en": {
+        "choose_language": "🌐 Выбери язык / Choose language:",
+        "btn_ru": "🇷🇺 Русский",
+        "btn_en": "🇺🇸 English",
+        "language_set": "✅ Language set: English",
+
+        "start": (
+            "👋 Hi, {name}!\n\n"
+            "🤖 *AlphaX Trade* — your AI trading assistant.\n\n"
+            "📊 Tracking: {assets_list}\n\n"
+            "I analyze using *{max_score} factors*: 5 technical indicators "
+            "+ news (weighted as 2 indicators).\n"
+            "A signal fires only at *{min_score}/{max_score}* confirmations.\n\n"
+            "Every signal is explained point by point, with the actual market data time.\n\n"
+            "📌 Commands:\n"
+            "/signal — get a signal right now\n"
+            "/subscribe — auto-signals every 2.5 hours\n"
+            "/unsubscribe — turn off\n"
+            "/language — change language\n"
+            "/help — how it works"
+        ),
+
+        "help": (
+            "🤖 *How AlphaX Trade works:*\n\n"
+            "*Assets:*\n{assets_list}\n\n"
+            "*5 technical indicators (1 point each):*\n"
+            "1. RSI — overbought/oversold\n"
+            "2. MACD — momentum direction\n"
+            "3. Bollinger Bands — price at the edge of the channel\n"
+            "4. 4H trend — overall market direction\n"
+            "5. Volume — money confirming the move\n\n"
+            "*📰 News (up to 2 points):*\n"
+            "I read CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n"
+            "If there are already 3-4 technical confirmations and news agrees with the "
+            "direction — that's enough for a signal, you don't need all 5 technical ones.\n\n"
+            "🕐 Every signal shows the time of the actual market data — with its own "
+            "UTC offset (e.g. UTC-4), not our server's time. Data comes from Yahoo Finance. "
+            "If the time shown by Telegram itself looks different, that's just your phone's "
+            "own timezone display — go by the time printed inside the message.\n\n"
+            "⚠️ *Important:* a «bearish» signal isn't «bad» — it's just a downward market direction. "
+            "The bot gives signals for both BUY (LONG) and SELL (SHORT) equally.\n\n"
+            "✅ {min_score}/{max_score} = Good signal\n"
+            "💪 {near_max}/{max_score} = Very good\n"
+            "🔥 {max_score}/{max_score} = Strong\n\n"
+            "/signal — get a signal now\n"
+            "/subscribe — auto-signals every 2.5h\n"
+            "/unsubscribe — turn off\n"
+            "/language — change language\n\n"
+            "⚠️ Stocks, NASDAQ and S&P 500 only update during exchange trading hours "
+            "(weekdays, US time). Crypto and gold — nearly 24/7.\n\n"
+            "⚠️ Not financial advice."
+        ),
+
+        "choose_asset": "Choose an asset:",
+        "analyzing": "🔍 Analyzing the market + reading the news, 10-15 sec...",
+        "error": "❌ Error: {error}",
+
+        "sub_already": "✅ You're already subscribed to auto-signals!",
+        "sub_activated": (
+            "✅ *Auto-signals activated!*\n\n"
+            "I analyze all assets every 2.5 hours.\n"
+            "Weak signals are skipped.\n"
+            "News is checked automatically.\n\n"
+            "Turn off: /unsubscribe"
+        ),
+        "unsub_done": "❌ Auto-signals turned off.\nCome back: /subscribe",
+        "unsub_none": "You weren't subscribed.",
+
+        "header_signal": "📊 *{symbol} Signal*\n\n",
+        "header_auto": "🔔 *{symbol} Auto-signal*\n\n",
+
+        "dir_buy": "🟢 BUY (LONG)",
+        "dir_sell": "🔴 SELL (SHORT)",
+        "dir_wait": "⚪️ WAIT",
+
+        "str_strong": "🔥 STRONG",
+        "str_verygood": "💪 VERY GOOD",
+        "str_good": "✅ GOOD",
+        "str_dash": "—",
+
+        "lbl_direction": "Direction",
+        "lbl_strength": "Strength",
+        "lbl_entry": "📍 Entry point",
+        "lbl_tp": "🎯 Take-profit",
+        "lbl_sl": "🛡 Stop-loss",
+        "lbl_reasons": "📋 *Why this signal:*",
+        "lbl_rsi": "📈 RSI",
+        "lbl_price": "💵 Price",
+        "lbl_confirmations": "Confirmations",
+        "lbl_news": "📰 News",
+        "lbl_waiting": "⏳ Waiting for a clear signal...",
+        "lbl_disclaimer": "⚠️ Not financial advice",
+        "lbl_signal_time": "🕐 Quote time: {time}",
+
+        "score_combined": "technicals {tech}/5 + news 📰 = *{total}/7*",
+        "score_tech_only": "technicals {tech}/5 = *{total}/7* (news not counted)",
+        "need_min": "need at least {min_score}/{max_score}",
+
+        "conflict_warning": "\n\n⚠️ *Careful:* news contradicts the signal ({news_text})",
+
+        "reason_rsi_oversold": "RSI = {rsi} (below 30 — asset is oversold, a reversal up often follows)",
+        "reason_rsi_overbought": "RSI = {rsi} (above 70 — asset is overbought, a reversal down often follows)",
+        "reason_macd_bull": "MACD above the signal line — upward momentum building",
+        "reason_macd_bear": "MACD below the signal line — downward momentum building",
+        "reason_bb_lower": "Price at the lower Bollinger Band — statistically «cheap», a bounce up is likely",
+        "reason_bb_upper": "Price at the upper Bollinger Band — statistically «expensive», a pullback down is likely",
+        "reason_trend_up": "Higher timeframe (4H): EMA20 above EMA50 — overall trend is up",
+        "reason_trend_down": "Higher timeframe (4H): EMA20 below EMA50 — overall trend is down",
+        "reason_vol_bull": "Trading volume ×{ratio} of average — large players are buying the rally",
+        "reason_vol_bear": "Trading volume ×{ratio} of average — large players are selling",
+        "reason_news_buy": "News: {news_text} — reinforces the buy signal",
+        "reason_news_sell": "News: {news_text} — reinforces the sell signal",
+
+        "news_bullish": "🟢 Bullish (in headlines: {bull} words for growth / {bear} for decline)",
+        "news_bearish": "🔴 Bearish (in headlines: {bear} words for decline / {bull} for growth)",
+        "news_neutral": "⚪ Neutral",
+    },
+}
+
+
+def render(lang: str, key: str, **params) -> str:
+    """Достаёт шаблон по ключу и языку, подставляет параметры."""
+    return LANG[lang][key].format(**params)
+
+# ================================================================
+# АНАЛИЗ НОВОСТЕЙ (RSS + ключевые слова) — язык-независимый слой
 # ================================================================
 
 _news_cache: dict = {}
@@ -142,18 +422,16 @@ BEARISH_WORDS = [
     "miss", "downgrade", "underperform", "layoffs", "recall",
 ]
 
-def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str]:
+def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str, dict]:
     """
-    Возвращает (score, текст).
+    Возвращает (score, ключ_шаблона, параметры) — БЕЗ привязки к языку.
     score: +1 бычьи слова перевешивают, -1 медвежьи перевешивают, 0 нейтрально.
-    Числа в тексте — это подсчёт КЛЮЧЕВЫХ СЛОВ в заголовках, а не готовые
-    подтверждения из шкалы 0-7 (не путать одно с другим).
     """
     now = time.time()
     if symbol in _news_cache:
-        ts, score, text = _news_cache[symbol]
+        ts, score, key, params = _news_cache[symbol]
         if now - ts < NEWS_TTL:
-            return score, text
+            return score, key, params
 
     feeds = FEEDS_BY_CLASS.get(asset_class, FEEDS_BY_CLASS["stock"])
     bull, bear = 0, 0
@@ -162,25 +440,25 @@ def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str]:
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries[:5]:
-                t = entry.get("title", "").lower()
-                bull += sum(1 for w in BULLISH_WORDS if w in t)
-                bear += sum(1 for w in BEARISH_WORDS if w in t)
+                title = entry.get("title", "").lower()
+                bull += sum(1 for w in BULLISH_WORDS if w in title)
+                bear += sum(1 for w in BEARISH_WORDS if w in title)
         except Exception as e:
             logger.warning(f"RSS ошибка {url}: {e}")
 
     if bull > bear:
-        score, text = 1, f"🟢 Бычий (в заголовках: {bull} слов за рост / {bear} за падение)"
+        score, key, params = 1, "news_bullish", {"bull": bull, "bear": bear}
     elif bear > bull:
-        score, text = -1, f"🔴 Медвежий (в заголовках: {bear} слов за падение / {bull} за рост)"
+        score, key, params = -1, "news_bearish", {"bull": bull, "bear": bear}
     else:
-        score, text = 0, "⚪ Нейтральный"
+        score, key, params = 0, "news_neutral", {}
 
-    _news_cache[symbol] = (now, score, text)
-    logger.info(f"Новости {symbol}: {text}")
-    return score, text
+    _news_cache[symbol] = (now, score, key, params)
+    logger.info(f"Новости {symbol}: bull={bull} bear={bear} -> {key}")
+    return score, key, params
 
 # ================================================================
-# ТЕХНИЧЕСКИЙ АНАЛИЗ
+# ТЕХНИЧЕСКИЙ АНАЛИЗ — язык-независимый слой
 # ================================================================
 
 def _get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -191,94 +469,71 @@ def _get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     l = [c for c in bb.columns if c.startswith("BBL")][0]
     return bb[u], bb[l]
 
+def _format_market_time(ts) -> str:
+    """
+    ts — pandas Timestamp последней свечи, как её вернул yfinance
+    (уже привязан к часовому поясу конкретного рынка/актива).
+    Показываем это время как есть, с явным смещением UTC — это время
+    самих данных, а не время сервера бота.
+    """
+    if ts.tzinfo is None:
+        return ts.strftime("%d.%m %H:%M")
+    offset = ts.utcoffset()
+    if offset is None:
+        return ts.strftime("%d.%m %H:%M")
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hh, mm = divmod(abs(total_minutes), 60)
+    offset_str = f"UTC{sign}{hh}" + (f":{mm:02d}" if mm else "")
+    return f"{ts.strftime('%d.%m %H:%M')} ({offset_str})"
+
 def _score_technical(rsi, macd, macd_s, price, bbu, bbl, trend_bull, vol_ratio):
-    """
-    Каждый индикатор даёт 1 балл ЛИБО покупке (bs), ЛИБО продаже (ss).
-    Если индикатор нейтрален (например RSI между 30 и 70) — он не даёт
-    ничего никому, поэтому bs + ss не всегда равно 5.
-    """
-    bs, ss, br, sr = 0, 0, [], []
+    """Каждый индикатор возвращает (ключ_шаблона, параметры), а не готовый текст."""
+    bs, ss = 0, 0
+    br, sr = [], []
 
     if rsi < 30:
         bs += 1
-        br.append(f"RSI = {rsi} (ниже 30 — актив перепродан, часто следует разворот вверх)")
+        br.append(("reason_rsi_oversold", {"rsi": rsi}))
     elif rsi > 70:
         ss += 1
-        sr.append(f"RSI = {rsi} (выше 70 — актив перекуплен, часто следует разворот вниз)")
+        sr.append(("reason_rsi_overbought", {"rsi": rsi}))
 
     if macd > macd_s:
         bs += 1
-        br.append("MACD выше сигнальной линии — восходящий импульс набирает силу")
+        br.append(("reason_macd_bull", {}))
     else:
         ss += 1
-        sr.append("MACD ниже сигнальной линии — нисходящий импульс набирает силу")
+        sr.append(("reason_macd_bear", {}))
 
     if price <= bbl * 1.005:
         bs += 1
-        br.append("Цена у нижней границы Bollinger Bands — статистически «дёшево», вероятен отскок вверх")
+        br.append(("reason_bb_lower", {}))
     elif price >= bbu * 0.995:
         ss += 1
-        sr.append("Цена у верхней границы Bollinger Bands — статистически «дорого», вероятен откат вниз")
+        sr.append(("reason_bb_upper", {}))
 
     if trend_bull:
         bs += 1
-        br.append("Старший таймфрейм (4H): EMA20 выше EMA50 — общий тренд вверх")
+        br.append(("reason_trend_up", {}))
     else:
         ss += 1
-        sr.append("Старший таймфрейм (4H): EMA20 ниже EMA50 — общий тренд вниз")
+        sr.append(("reason_trend_down", {}))
 
     if vol_ratio >= 1.5:
         if bs >= ss:
             bs += 1
-            br.append(f"Объём торгов ×{round(vol_ratio,1)} от среднего — крупные игроки заходят в рост")
+            br.append(("reason_vol_bull", {"ratio": round(vol_ratio, 1)}))
         else:
             ss += 1
-            sr.append(f"Объём торгов ×{round(vol_ratio,1)} от среднего — крупные игроки продают")
+            sr.append(("reason_vol_bear", {"ratio": round(vol_ratio, 1)}))
 
     return bs, ss, br, sr
-
-def build_result(symbol, direction, total_score, tech_score, price, tp_pct, sl_pct,
-                  rsi, reasons, news_text, conflicts, news_helped):
-    if total_score == MAX_SCORE:
-        strength = "🔥 СИЛЬНЫЙ"
-    elif total_score == MAX_SCORE - 1:
-        strength = "💪 ОЧЕНЬ ХОРОШИЙ"
-    else:
-        strength = "✅ ХОРОШИЙ"
-
-    if direction == "LONG":
-        entry_dir   = "🟢 ПОКУПАЙ (LONG)"
-        take_profit = round(price * (1 + tp_pct), 2)
-        stop_loss   = round(price * (1 - sl_pct), 2)
-    else:
-        entry_dir   = "🔴 ПРОДАВАЙ (SHORT)"
-        take_profit = round(price * (1 - tp_pct), 2)
-        stop_loss   = round(price * (1 + sl_pct), 2)
-
-    return {
-        "symbol": symbol, "direction": entry_dir, "strength": strength,
-        "score": f"{total_score}/{MAX_SCORE}", "tech_score": f"{tech_score}/5",
-        "entry": round(price, 2),
-        "take_profit": take_profit, "stop_loss": stop_loss,
-        "rsi": rsi, "reasons": reasons,
-        "news_text": news_text, "news_conflicts": conflicts,
-        "news_helped": news_helped,
-    }
-
-def wait_result(symbol, tech_score, total_score, price, rsi, news_text, news_helped):
-    return {
-        "symbol": symbol, "direction": "⚪️ ЖДАТЬ", "strength": "—",
-        "score": f"{total_score}/{MAX_SCORE}", "tech_score": f"{tech_score}/5",
-        "entry": round(price, 2),
-        "take_profit": None, "stop_loss": None, "rsi": rsi,
-        "reasons": ["Недостаточно подтверждений — ждём лучшей точки входа"],
-        "news_text": news_text, "news_conflicts": False,
-        "news_helped": news_helped,
-    }
 
 def _analyze(asset_key: str) -> dict:
     """
     Анализ актива: 5 технических индикаторов + новости (вес x2, максимум 7 баллов).
+    Результат полностью язык-независим — рендер под конкретный язык делает fmt().
     Выполняется в отдельном потоке через asyncio.to_thread — не блокирует бота.
     """
     cfg = ASSETS[asset_key]
@@ -289,6 +544,8 @@ def _analyze(asset_key: str) -> dict:
     df = yf.Ticker(ticker_symbol).history(period=period, interval="1h")
     if df.empty:
         raise ValueError(f"Нет данных: {display_symbol}")
+
+    bar_time = df.index[-1]  # время последней свечи — родное для этого рынка
 
     df.columns = [c.lower() for c in df.columns]
     df["e20"]  = ta.ema(df["close"], 20)
@@ -311,175 +568,221 @@ def _analyze(asset_key: str) -> dict:
         rsi, float(last["macd"]), float(last["ms"]),
         p, float(last["bbu"]), float(last["bbl"]), trend, vr
     )
-    tech_bs, tech_ss = bs, ss  # технический счёт ДО добавления новостей
+    tech_bs, tech_ss = bs, ss
 
-    news_score, news_text = _fetch_news(display_symbol, asset_class)
+    news_score, news_key, news_params = _fetch_news(display_symbol, asset_class)
     if news_score > 0:
         bs += NEWS_WEIGHT
-        br.append(f"Новости: {news_text} — усиливают сигнал на покупку")
     elif news_score < 0:
         ss += NEWS_WEIGHT
-        sr.append(f"Новости: {news_text} — усиливают сигнал на продажу")
+
+    common = {
+        "symbol": display_symbol,
+        "rsi": rsi,
+        "entry": round(p, 2),
+        "news_key": news_key,
+        "news_params": news_params,
+        "data_time": bar_time,
+    }
 
     if bs >= MIN_SCORE and bs > ss:
-        return build_result(display_symbol, "LONG", bs, tech_bs, p, tp, sl, rsi, br,
-                             news_text, conflicts=(news_score < 0),
-                             news_helped=(news_score > 0))
+        return {
+            **common,
+            "direction": "LONG",
+            "total_score": bs, "tech_score": tech_bs,
+            "take_profit": round(p * (1 + tp), 2),
+            "stop_loss": round(p * (1 - sl), 2),
+            "reasons": br,
+            "news_conflicts": news_score < 0,
+            "news_helped": news_score > 0,
+        }
+
     if ss >= MIN_SCORE and ss > bs:
-        return build_result(display_symbol, "SHORT", ss, tech_ss, p, tp, sl, rsi, sr,
-                             news_text, conflicts=(news_score > 0),
-                             news_helped=(news_score < 0))
+        return {
+            **common,
+            "direction": "SHORT",
+            "total_score": ss, "tech_score": tech_ss,
+            "take_profit": round(p * (1 - tp), 2),
+            "stop_loss": round(p * (1 + sl), 2),
+            "reasons": sr,
+            "news_conflicts": news_score > 0,
+            "news_helped": news_score < 0,
+        }
 
     if bs >= ss:
-        return wait_result(display_symbol, tech_bs, bs, p, rsi, news_text,
-                            news_helped=(news_score > 0))
-    return wait_result(display_symbol, tech_ss, ss, p, rsi, news_text,
-                        news_helped=(news_score < 0))
+        return {
+            **common, "direction": "WAIT",
+            "total_score": bs, "tech_score": tech_bs,
+            "take_profit": None, "stop_loss": None,
+            "reasons": [], "news_conflicts": False,
+            "news_helped": news_score > 0,
+        }
+    return {
+        **common, "direction": "WAIT",
+        "total_score": ss, "tech_score": tech_ss,
+        "take_profit": None, "stop_loss": None,
+        "reasons": [], "news_conflicts": False,
+        "news_helped": news_score < 0,
+    }
 
 # ================================================================
-# ФОРМАТИРОВАНИЕ
+# ФОРМАТИРОВАНИЕ — единственное место, где нужен язык
 # ================================================================
 
-def fmt(data: dict, is_auto: bool = False) -> str:
-    sym    = data["symbol"]
-    header = f"🔔 *Автосигнал {sym}*\n\n" if is_auto else f"📊 *Сигнал {sym}*\n\n"
+def fmt(data: dict, lang: str, is_auto: bool = False) -> str:
+    t = LANG[lang]
+    sym = data["symbol"]
+    header = (t["header_auto"] if is_auto else t["header_signal"]).format(symbol=sym)
 
-    if data["news_helped"]:
-        score_line = f"техника {data['tech_score']} + новости 📰 = *{data['score']}*"
+    direction_label = {
+        "LONG": t["dir_buy"], "SHORT": t["dir_sell"], "WAIT": t["dir_wait"]
+    }[data["direction"]]
+
+    time_line = t["lbl_signal_time"].format(time=_format_market_time(data["data_time"]))
+    news_text = render(lang, data["news_key"], **data["news_params"])
+
+    if data["direction"] == "WAIT":
+        strength = t["str_dash"]
+    elif data["total_score"] == MAX_SCORE:
+        strength = t["str_strong"]
+    elif data["total_score"] == MAX_SCORE - 1:
+        strength = t["str_verygood"]
     else:
-        score_line = f"техника {data['tech_score']} = *{data['score']}* (новости не в счёт)"
+        strength = t["str_good"]
 
-    if data["take_profit"]:
-        reasons  = "\n".join(f"{i+1}. {r}" for i, r in enumerate(data["reasons"]))
-        conflict = (
-            f"\n\n⚠️ *Осторожно:* новости против сигнала ({data['news_text']})"
-            if data["news_conflicts"] else ""
-        )
+    score_line = (t["score_combined"] if data["news_helped"] else t["score_tech_only"]).format(
+        tech=data["tech_score"], total=data["total_score"]
+    )
+
+    if data["direction"] != "WAIT":
+        rendered = [render(lang, k, **p) for k, p in data["reasons"]]
+        if data["news_helped"]:
+            key = "reason_news_buy" if data["direction"] == "LONG" else "reason_news_sell"
+            rendered.append(t[key].format(news_text=news_text))
+        reasons_block = "\n".join(f"{i+1}. {r}" for i, r in enumerate(rendered))
+
+        conflict = t["conflict_warning"].format(news_text=news_text) if data["news_conflicts"] else ""
+
         return (
             f"{header}"
-            f"Направление: {data['direction']}\n"
-            f"Сила: {data['strength']} — {score_line}\n\n"
-            f"📍 Точка входа: `${data['entry']}`\n"
-            f"🎯 Тейк-профит: `${data['take_profit']}`\n"
-            f"🛡 Стоп-лосс: `${data['stop_loss']}`\n\n"
-            f"📋 *Почему этот сигнал:*\n{reasons}"
+            f"{t['lbl_direction']}: {direction_label}\n"
+            f"{t['lbl_strength']}: {strength} — {score_line}\n\n"
+            f"{t['lbl_entry']}: `${data['entry']}`\n"
+            f"{t['lbl_tp']}: `${data['take_profit']}`\n"
+            f"{t['lbl_sl']}: `${data['stop_loss']}`\n\n"
+            f"{t['lbl_reasons']}\n{reasons_block}"
             f"{conflict}\n\n"
-            f"📈 RSI: `{data['rsi']}`\n\n"
-            f"⚠️ Не является финансовым советом"
+            f"{t['lbl_rsi']}: `{data['rsi']}`\n"
+            f"{time_line}\n\n"
+            f"{t['lbl_disclaimer']}"
         )
 
     return (
         f"{header}"
-        f"Направление: {data['direction']}\n"
-        f"Подтверждений: {score_line} — нужно минимум {MIN_SCORE}/{MAX_SCORE}\n\n"
-        f"💵 Цена: `${data['entry']}`\n"
-        f"📈 RSI: `{data['rsi']}`\n\n"
-        f"📰 Новости: {data['news_text']}\n\n"
-        f"⏳ Ждём чёткого сигнала...\n\n"
-        f"⚠️ Не является финансовым советом"
+        f"{t['lbl_direction']}: {direction_label}\n"
+        f"{t['lbl_confirmations']}: {score_line} — "
+        f"{t['need_min'].format(min_score=MIN_SCORE, max_score=MAX_SCORE)}\n\n"
+        f"{t['lbl_price']}: `${data['entry']}`\n"
+        f"{t['lbl_rsi']}: `{data['rsi']}`\n\n"
+        f"{t['lbl_news']}: {news_text}\n\n"
+        f"{t['lbl_waiting']}\n"
+        f"{time_line}\n\n"
+        f"{t['lbl_disclaimer']}"
     )
 
 # ================================================================
-# КОМАНДЫ БОТА
+# ВЫБОР ЯЗЫКА
+# ================================================================
+
+def _lang_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(LANG["ru"]["btn_ru"], callback_data="lang_ru"),
+        InlineKeyboardButton(LANG["en"]["btn_en"], callback_data="lang_en"),
+    ]])
+
+async def _send_start(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user, lang: str):
+    assets_list = ", ".join(f"{c['emoji']}{c['name']}" for c in ASSETS.values())
+    text = LANG[lang]["start"].format(
+        name=user.first_name, assets_list=assets_list,
+        max_score=MAX_SCORE, min_score=MIN_SCORE
+    )
+    await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(LANG["ru"]["choose_language"], reply_markup=_lang_keyboard())
+
+# ================================================================
+# КОМАНДЫ ПОЛЬЗОВАТЕЛЯ
 # ================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    assets_list = ", ".join(f"{c['emoji']}{c['name']}" for c in ASSETS.values())
-    await update.message.reply_text(
-        f"👋 Привет, {u.first_name}!\n\n"
-        f"🤖 *AlphaX Trade* — твой ИИ-помощник для трейдинга.\n\n"
-        f"📊 Слежу за: {assets_list}\n\n"
-        f"Анализирую по *{MAX_SCORE} факторам*: 5 технических индикаторов "
-        f"+ новости (весят как 2 индикатора).\n"
-        f"Сигнал только при *{MIN_SCORE}/{MAX_SCORE}* подтверждениях.\n\n"
-        f"Каждый сигнал объясняю по пунктам — почему он сработал.\n\n"
-        f"📌 Команды:\n"
-        f"/signal — сигнал прямо сейчас\n"
-        f"/subscribe — автосигналы каждые 2.5 часа\n"
-        f"/unsubscribe — отключить\n"
-        f"/help — как это работает",
-        parse_mode="Markdown"
-    )
+    lang = get_language(u.id)
+    if lang is None:
+        await update.message.reply_text(LANG["ru"]["choose_language"], reply_markup=_lang_keyboard())
+        return
+    await _send_start(update.effective_chat.id, context, u, lang)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_language(update.effective_user.id) or "ru"
     assets_list = "\n".join(f"{c['emoji']} {c['name']}" for c in ASSETS.values())
-    await update.message.reply_text(
-        "🤖 *Как работает AlphaX Trade:*\n\n"
-        f"*Активы:*\n{assets_list}\n\n"
-        "*5 технических индикаторов (1 балл каждый):*\n"
-        "1. RSI — перекупленность/перепроданность\n"
-        "2. MACD — направление импульса\n"
-        "3. Bollinger Bands — цена на краю канала\n"
-        "4. Тренд 4H — глобальное направление рынка\n"
-        "5. Объём — деньги подтверждают движение\n\n"
-        "*📰 Новости (до 2 баллов):*\n"
-        "Читаю CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n"
-        "Если технических подтверждений уже 3-4 и новости совпадают по "
-        "направлению — этого хватит для сигнала, все 5 технических ждать не нужно.\n\n"
-        "⚠️ *Важно:* «Медвежий» сигнал — не «плохо», это направление рынка вниз. "
-        "Бот одинаково даёт сигналы и на ПОКУПКУ (LONG), и на ПРОДАЖУ (SHORT). "
-        "Цифры вида «5 слов за падение» в новостях — это подсчёт ключевых слов "
-        "в заголовках, а не готовые баллы из шкалы 0-7.\n\n"
-        f"✅ {MIN_SCORE}/{MAX_SCORE} = Хороший сигнал\n"
-        f"💪 {MAX_SCORE-1}/{MAX_SCORE} = Очень хороший\n"
-        f"🔥 {MAX_SCORE}/{MAX_SCORE} = Сильный\n\n"
-        "/signal — сигнал сейчас\n"
-        "/subscribe — автосигналы каждые 2.5ч\n"
-        "/unsubscribe — отключить\n\n"
-        "⚠️ Акции и NASDAQ обновляются только в часы торгов биржи "
-        "(будни, US-время). Крипта и золото — почти круглосуточно.\n\n"
-        "⚠️ Не является финансовым советом.",
-        parse_mode="Markdown"
+    text = LANG[lang]["help"].format(
+        assets_list=assets_list, min_score=MIN_SCORE, max_score=MAX_SCORE, near_max=MAX_SCORE - 1
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_language(update.effective_user.id) or "ru"
     buttons = [
         InlineKeyboardButton(f"{cfg['emoji']} {cfg['name']}", callback_data=f"sig_{key}")
         for key, cfg in ASSETS.items()
     ]
     kb = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    await update.message.reply_text("Выбери актив:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(LANG[lang]["choose_asset"], reply_markup=InlineKeyboardMarkup(kb))
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.message.chat_id
+    lang = get_language(update.effective_user.id) or "ru"
     if cid in get_subscribers():
-        await update.message.reply_text("✅ Ты уже подписан на автосигналы!")
+        await update.message.reply_text(LANG[lang]["sub_already"])
     else:
         add_subscriber(cid)
-        await update.message.reply_text(
-            "✅ *Автосигналы активированы!*\n\n"
-            "Каждые 2.5 часа анализирую все активы.\n"
-            "Слабые сигналы пропускаю.\n"
-            "Новости проверяю автоматически.\n\n"
-            "Отключить: /unsubscribe",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(LANG[lang]["sub_activated"], parse_mode="Markdown")
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.message.chat_id
+    lang = get_language(update.effective_user.id) or "ru"
     if cid in get_subscribers():
         remove_subscriber(cid)
-        await update.message.reply_text("❌ Автосигналы отключены.\nВернуться: /subscribe")
+        await update.message.reply_text(LANG[lang]["unsub_done"])
     else:
-        await update.message.reply_text("Ты не был подписан.")
+        await update.message.reply_text(LANG[lang]["unsub_none"])
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not q.data.startswith("sig_"):
-        return
-    asset_key = q.data.removeprefix("sig_")
-    if asset_key not in ASSETS:
+
+    if q.data.startswith("lang_"):
+        lang = q.data.removeprefix("lang_")
+        if lang not in LANG:
+            return
+        set_language(q.from_user.id, lang)
+        await q.edit_message_text(LANG[lang]["language_set"])
+        await _send_start(q.message.chat_id, context, q.from_user, lang)
         return
 
-    await q.edit_message_text("🔍 Анализирую рынок + читаю новости, 10-15 сек...")
-    try:
-        data = await asyncio.to_thread(_analyze, asset_key)
-        await q.edit_message_text(fmt(data), parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Ошибка сигнала {asset_key}: {e}")
-        await q.edit_message_text(f"❌ Ошибка: {e}")
+    if q.data.startswith("sig_"):
+        asset_key = q.data.removeprefix("sig_")
+        if asset_key not in ASSETS:
+            return
+        lang = get_language(q.from_user.id) or "ru"
+        await q.edit_message_text(LANG[lang]["analyzing"])
+        try:
+            data = await asyncio.to_thread(_analyze, asset_key)
+            await q.edit_message_text(fmt(data, lang), parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Ошибка сигнала {asset_key}: {e}")
+            await q.edit_message_text(LANG[lang]["error"].format(error=e))
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -508,11 +811,11 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
     for key, cfg in ASSETS.items():
         try:
             data = await asyncio.to_thread(_analyze, key)
-            if data["direction"] != "⚪️ ЖДАТЬ":
+            if data["direction"] != "WAIT":
                 to_send.append(data)
-                logger.info(f"{cfg['name']}: {data['direction']} ({data['score']})")
+                logger.info(f"{cfg['name']}: {data['direction']} ({data['total_score']}/{MAX_SCORE})")
             else:
-                logger.info(f"{cfg['name']}: ЖДАТЬ — пропущен")
+                logger.info(f"{cfg['name']}: WAIT — пропущен")
         except Exception as e:
             logger.error(f"Ошибка {cfg['name']}: {e}")
         await asyncio.sleep(1)
@@ -523,9 +826,10 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
 
     dead = set()
     for cid in subs.copy():
+        lang = get_language(cid) or "ru"
         for d in to_send:
             try:
-                await context.bot.send_message(cid, fmt(d, is_auto=True), parse_mode="Markdown")
+                await context.bot.send_message(cid, fmt(d, lang, is_auto=True), parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Ошибка отправки {cid}: {e}")
                 dead.add(cid)
@@ -545,6 +849,7 @@ def main():
     app.add_handler(CommandHandler("subscribe",   subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("help",        help_command))
+    app.add_handler(CommandHandler("language",    language_command))
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
