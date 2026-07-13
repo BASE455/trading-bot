@@ -12,6 +12,7 @@ import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import feedparser
+import ccxt
 
 # ================================================================
 # КОНФИГУРАЦИЯ
@@ -36,10 +37,14 @@ MIN_SCORE   = 5   # минимум для сигнала
 # ================================================================
 # АКТИВЫ
 # ================================================================
+# Для крипты (class="crypto") цена берётся с биржи, выбранной пользователем
+# (см. _fetch_ohlcv_dataframe). "ticker" для крипты — это резервный тикер
+# Yahoo Finance на случай, если ОБЕ крипто-биржи вдруг недоступны.
 
 ASSETS = {
-    "btc":    {"ticker": "BTC-USD",  "name": "BTC/USD", "emoji": "₿",  "tp": 0.040,  "sl": 0.020,  "class": "crypto"},
-    "eth":    {"ticker": "ETH-USD",  "name": "ETH/USD", "emoji": "Ξ",  "tp": 0.040,  "sl": 0.020,  "class": "crypto"},
+    "btc":    {"ticker": "BTC-USD",  "crypto_symbol": "BTC/USDT", "name": "BTC/USD", "emoji": "₿",  "tp": 0.040, "sl": 0.020,  "class": "crypto"},
+    "eth":    {"ticker": "ETH-USD",  "crypto_symbol": "ETH/USDT", "name": "ETH/USD", "emoji": "Ξ",  "tp": 0.040, "sl": 0.020,  "class": "crypto"},
+    "sol":    {"ticker": "SOL-USD",  "crypto_symbol": "SOL/USDT", "name": "SOL/USD", "emoji": "◎",  "tp": 0.050, "sl": 0.025,  "class": "crypto"},
     "gold":   {"ticker": "GC=F",     "name": "XAUUSD",  "emoji": "🥇", "tp": 0.015,  "sl": 0.0075, "class": "gold"},
     "eur":    {"ticker": "EURUSD=X", "name": "EUR/USD", "emoji": "💶", "tp": 0.008,  "sl": 0.004,  "class": "forex"},
     "nasdaq": {"ticker": "^IXIC",    "name": "NASDAQ",  "emoji": "📈", "tp": 0.020,  "sl": 0.010,  "class": "stock"},
@@ -55,8 +60,10 @@ PERIOD_BY_CLASS = {
     "stock":  "30d",
 }
 
+DEFAULT_EXCHANGE = "binance"
+
 # ================================================================
-# ХРАНИЛИЩЕ (подписчики + язык пользователя)
+# ХРАНИЛИЩЕ (подписчики + язык + биржа пользователя)
 # ================================================================
 
 if DATABASE_URL:
@@ -73,6 +80,10 @@ if DATABASE_URL:
                     CREATE TABLE IF NOT EXISTS user_lang (
                         chat_id BIGINT PRIMARY KEY,
                         lang TEXT NOT NULL DEFAULT 'ru'
+                    );
+                    CREATE TABLE IF NOT EXISTS user_exchange (
+                        chat_id BIGINT PRIMARY KEY,
+                        exchange TEXT NOT NULL DEFAULT 'binance'
                     );
                 """)
             c.commit()
@@ -121,9 +132,26 @@ if DATABASE_URL:
                 """, (chat_id, lang))
             c.commit()
 
+    def get_crypto_exchange(chat_id: int):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT exchange FROM user_exchange WHERE chat_id=%s", (chat_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    def set_crypto_exchange(chat_id: int, exchange: str):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO user_exchange (chat_id, exchange) VALUES (%s, %s)
+                    ON CONFLICT (chat_id) DO UPDATE SET exchange = EXCLUDED.exchange
+                """, (chat_id, exchange))
+            c.commit()
+
 else:
     SUBS_FILE = "subscribers.json"
     LANG_FILE = "languages.json"
+    EXCHANGE_FILE = "exchanges.json"
 
     def init_storage(): pass
 
@@ -147,6 +175,14 @@ else:
         d[str(chat_id)] = lang
         _save_j(LANG_FILE, d)
 
+    def get_crypto_exchange(chat_id: int):
+        return _load_j(EXCHANGE_FILE, {}).get(str(chat_id))
+
+    def set_crypto_exchange(chat_id: int, exchange: str):
+        d = _load_j(EXCHANGE_FILE, {})
+        d[str(chat_id)] = exchange
+        _save_j(EXCHANGE_FILE, d)
+
 # ================================================================
 # ТЕКСТЫ RU / EN
 # ================================================================
@@ -157,6 +193,12 @@ LANG = {
         "btn_ru": "🇷🇺 Русский",
         "btn_en": "🇺🇸 English",
         "language_set": "✅ Язык установлен: Русский",
+
+        "choose_exchange": "Выбери биржу для крипто-сигналов (BTC, ETH, SOL):",
+        "btn_binance": "🟡 Binance",
+        "btn_bybit": "⚫ Bybit",
+        "exchange_set_binance": "✅ Биржа для крипто-сигналов: Binance\n\nСменить: /exchange",
+        "exchange_set_bybit": "✅ Биржа для крипто-сигналов: Bybit\n\nСменить: /exchange",
 
         "start": (
             "👋 Привет, {name}!\n\n"
@@ -170,6 +212,7 @@ LANG = {
             "/signal — сигнал прямо сейчас\n"
             "/subscribe — автосигналы каждые 2.5 часа\n"
             "/unsubscribe — отключить\n"
+            "/exchange — биржа для крипто-сигналов (Binance/Bybit)\n"
             "/language — сменить язык\n"
             "/help — как это работает"
         ),
@@ -188,9 +231,12 @@ LANG = {
             "Если технических подтверждений уже 3-4 и новости совпадают по "
             "направлению — этого хватит для сигнала, все 5 технических ждать не нужно.\n\n"
             "🕐 Каждый сигнал показывает время самих рыночных данных — с их родным "
-            "смещением UTC (например UTC-4), а не время нашего сервера. Данные — "
-            "с Yahoo Finance. Если время в самом Telegram выглядит иначе — это просто "
-            "часовой пояс твоего телефона, ориентируйся на время внутри сообщения.\n\n"
+            "смещением UTC, а не время нашего сервера.\n\n"
+            "💱 Крипта (BTC, ETH, SOL) — данные с выбранной тобой биржи, "
+            "Binance или Bybit (/exchange). Если биржа вдруг недоступна — бот "
+            "автоматически переключится на другую, а затем на Yahoo Finance.\n"
+            "Золото, EUR/USD, NASDAQ, S&P 500, AAPL, TSLA — всегда Yahoo Finance, "
+            "у крипто-бирж таких инструментов просто нет.\n\n"
             "⚠️ *Важно:* «медвежий» сигнал — не «плохо», это просто направление рынка вниз. "
             "Бот одинаково даёт сигналы и на ПОКУПКУ (LONG), и на ПРОДАЖУ (SHORT).\n\n"
             "✅ {min_score}/{max_score} = Хороший сигнал\n"
@@ -199,6 +245,7 @@ LANG = {
             "/signal — сигнал сейчас\n"
             "/subscribe — автосигналы каждые 2.5ч\n"
             "/unsubscribe — отключить\n"
+            "/exchange — биржа для крипты\n"
             "/language — сменить язык\n\n"
             "⚠️ Акции, NASDAQ и S&P 500 обновляются только в часы торгов биржи "
             "(будни, US-время). Крипта и золото — почти круглосуточно.\n\n"
@@ -275,6 +322,12 @@ LANG = {
         "btn_en": "🇺🇸 English",
         "language_set": "✅ Language set: English",
 
+        "choose_exchange": "Choose an exchange for crypto signals (BTC, ETH, SOL):",
+        "btn_binance": "🟡 Binance",
+        "btn_bybit": "⚫ Bybit",
+        "exchange_set_binance": "✅ Crypto signal exchange: Binance\n\nChange: /exchange",
+        "exchange_set_bybit": "✅ Crypto signal exchange: Bybit\n\nChange: /exchange",
+
         "start": (
             "👋 Hi, {name}!\n\n"
             "🤖 *AlphaX Trade* — your AI trading assistant.\n\n"
@@ -287,6 +340,7 @@ LANG = {
             "/signal — get a signal right now\n"
             "/subscribe — auto-signals every 2.5 hours\n"
             "/unsubscribe — turn off\n"
+            "/exchange — exchange for crypto signals (Binance/Bybit)\n"
             "/language — change language\n"
             "/help — how it works"
         ),
@@ -305,9 +359,12 @@ LANG = {
             "If there are already 3-4 technical confirmations and news agrees with the "
             "direction — that's enough for a signal, you don't need all 5 technical ones.\n\n"
             "🕐 Every signal shows the time of the actual market data — with its own "
-            "UTC offset (e.g. UTC-4), not our server's time. Data comes from Yahoo Finance. "
-            "If the time shown by Telegram itself looks different, that's just your phone's "
-            "own timezone display — go by the time printed inside the message.\n\n"
+            "UTC offset, not our server's time.\n\n"
+            "💱 Crypto (BTC, ETH, SOL) — data from your chosen exchange, "
+            "Binance or Bybit (/exchange). If that exchange is unavailable, the bot "
+            "automatically switches to the other one, then to Yahoo Finance.\n"
+            "Gold, EUR/USD, NASDAQ, S&P 500, AAPL, TSLA — always Yahoo Finance, "
+            "crypto exchanges simply don't have these instruments.\n\n"
             "⚠️ *Important:* a «bearish» signal isn't «bad» — it's just a downward market direction. "
             "The bot gives signals for both BUY (LONG) and SELL (SHORT) equally.\n\n"
             "✅ {min_score}/{max_score} = Good signal\n"
@@ -316,6 +373,7 @@ LANG = {
             "/signal — get a signal now\n"
             "/subscribe — auto-signals every 2.5h\n"
             "/unsubscribe — turn off\n"
+            "/exchange — crypto data exchange\n"
             "/language — change language\n\n"
             "⚠️ Stocks, NASDAQ and S&P 500 only update during exchange trading hours "
             "(weekdays, US time). Crypto and gold — nearly 24/7.\n\n"
@@ -458,6 +516,46 @@ def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str, dict]:
     return score, key, params
 
 # ================================================================
+# ИСТОЧНИКИ ЦЕН: крипто-биржи (ccxt) + Yahoo Finance
+# ================================================================
+
+def _make_exchange(exchange_name: str):
+    if exchange_name == "bybit":
+        return ccxt.bybit({"enableRateLimit": True})
+    return ccxt.binance({"enableRateLimit": True})
+
+def _fetch_crypto_ohlcv(symbol: str, exchange_name: str) -> pd.DataFrame:
+    exchange = _make_exchange(exchange_name)
+    raw = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=200)
+    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return df.set_index("ts")[["close", "volume"]]
+
+def _fetch_yahoo_ohlcv(cfg: dict) -> pd.DataFrame:
+    period = PERIOD_BY_CLASS.get(cfg["class"], "7d")
+    df = yf.Ticker(cfg["ticker"]).history(period=period, interval="1h")
+    df.columns = [c.lower() for c in df.columns]
+    return df[["close", "volume"]]
+
+def _fetch_ohlcv_dataframe(cfg: dict, exchange_pref: str = None) -> pd.DataFrame:
+    """
+    Крипта: пробуем предпочтение пользователя, при сбое — вторую крипто-биржу,
+    и только потом Yahoo как последний резерв. Остальные классы — сразу Yahoo,
+    у бирж этих инструментов просто нет.
+    """
+    if cfg["class"] == "crypto":
+        preferred = exchange_pref or DEFAULT_EXCHANGE
+        other = "bybit" if preferred == "binance" else "binance"
+        for exch in (preferred, other):
+            try:
+                return _fetch_crypto_ohlcv(cfg["crypto_symbol"], exch)
+            except Exception as e:
+                logger.warning(f"{exch} недоступен для {cfg['crypto_symbol']}: {e}")
+        logger.warning(f"Обе крипто-биржи недоступны для {cfg['crypto_symbol']}, использую Yahoo")
+
+    return _fetch_yahoo_ohlcv(cfg)
+
+# ================================================================
 # ТЕХНИЧЕСКИЙ АНАЛИЗ — язык-независимый слой
 # ================================================================
 
@@ -471,10 +569,9 @@ def _get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
 
 def _format_market_time(ts) -> str:
     """
-    ts — pandas Timestamp последней свечи, как её вернул yfinance
-    (уже привязан к часовому поясу конкретного рынка/актива).
-    Показываем это время как есть, с явным смещением UTC — это время
-    самих данных, а не время сервера бота.
+    ts — pandas Timestamp последней свечи (уже привязан к часовому поясу
+    конкретного рынка/биржи). Показываем как есть, с явным смещением UTC —
+    это время самих данных, а не время сервера бота.
     """
     if ts.tzinfo is None:
         return ts.strftime("%d.%m %H:%M")
@@ -530,24 +627,23 @@ def _score_technical(rsi, macd, macd_s, price, bbu, bbl, trend_bull, vol_ratio):
 
     return bs, ss, br, sr
 
-def _analyze(asset_key: str) -> dict:
+def _analyze(asset_key: str, exchange_pref: str = None) -> dict:
     """
     Анализ актива: 5 технических индикаторов + новости (вес x2, максимум 7 баллов).
     Результат полностью язык-независим — рендер под конкретный язык делает fmt().
+    exchange_pref используется только для активов класса "crypto".
     Выполняется в отдельном потоке через asyncio.to_thread — не блокирует бота.
     """
     cfg = ASSETS[asset_key]
-    ticker_symbol, display_symbol = cfg["ticker"], cfg["name"]
-    tp, sl, asset_class = cfg["tp"], cfg["sl"], cfg["class"]
-    period = PERIOD_BY_CLASS.get(asset_class, "7d")
+    display_symbol = cfg["name"]
+    tp, sl = cfg["tp"], cfg["sl"]
 
-    df = yf.Ticker(ticker_symbol).history(period=period, interval="1h")
+    df = _fetch_ohlcv_dataframe(cfg, exchange_pref)
     if df.empty:
         raise ValueError(f"Нет данных: {display_symbol}")
 
-    bar_time = df.index[-1]  # время последней свечи — родное для этого рынка
+    bar_time = df.index[-1]  # время последней свечи — родное для этого источника
 
-    df.columns = [c.lower() for c in df.columns]
     df["e20"]  = ta.ema(df["close"], 20)
     df["e50"]  = ta.ema(df["close"], 50)
     trend      = bool(df.iloc[-1]["e20"] > df.iloc[-1]["e50"])
@@ -570,7 +666,7 @@ def _analyze(asset_key: str) -> dict:
     )
     tech_bs, tech_ss = bs, ss
 
-    news_score, news_key, news_params = _fetch_news(display_symbol, asset_class)
+    news_score, news_key, news_params = _fetch_news(display_symbol, cfg["class"])
     if news_score > 0:
         bs += NEWS_WEIGHT
     elif news_score < 0:
@@ -691,13 +787,19 @@ def fmt(data: dict, lang: str, is_auto: bool = False) -> str:
     )
 
 # ================================================================
-# ВЫБОР ЯЗЫКА
+# ВЫБОР ЯЗЫКА / БИРЖИ
 # ================================================================
 
 def _lang_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(LANG["ru"]["btn_ru"], callback_data="lang_ru"),
         InlineKeyboardButton(LANG["en"]["btn_en"], callback_data="lang_en"),
+    ]])
+
+def _exchange_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(LANG["ru"]["btn_binance"], callback_data="exch_binance"),
+        InlineKeyboardButton(LANG["ru"]["btn_bybit"], callback_data="exch_bybit"),
     ]])
 
 async def _send_start(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user, lang: str):
@@ -710,6 +812,10 @@ async def _send_start(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user, la
 
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(LANG["ru"]["choose_language"], reply_markup=_lang_keyboard())
+
+async def exchange_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_language(update.effective_user.id) or "ru"
+    await update.message.reply_text(LANG[lang]["choose_exchange"], reply_markup=_exchange_keyboard())
 
 # ================================================================
 # КОМАНДЫ ПОЛЬЗОВАТЕЛЯ
@@ -771,14 +877,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_start(q.message.chat_id, context, q.from_user, lang)
         return
 
+    if q.data.startswith("exch_"):
+        exch = q.data.removeprefix("exch_")
+        if exch not in ("binance", "bybit"):
+            return
+        set_crypto_exchange(q.from_user.id, exch)
+        lang = get_language(q.from_user.id) or "ru"
+        key = "exchange_set_binance" if exch == "binance" else "exchange_set_bybit"
+        await q.edit_message_text(LANG[lang][key])
+        return
+
     if q.data.startswith("sig_"):
         asset_key = q.data.removeprefix("sig_")
         if asset_key not in ASSETS:
             return
         lang = get_language(q.from_user.id) or "ru"
+        exch_pref = get_crypto_exchange(q.from_user.id) or DEFAULT_EXCHANGE
         await q.edit_message_text(LANG[lang]["analyzing"])
         try:
-            data = await asyncio.to_thread(_analyze, asset_key)
+            data = await asyncio.to_thread(_analyze, asset_key, exch_pref)
             await q.edit_message_text(fmt(data, lang), parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Ошибка сигнала {asset_key}: {e}")
@@ -806,13 +923,19 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(f"Автосигналы: {len(subs)} подписчиков, {len(ASSETS)} активов")
-    to_send = []
 
+    exch_by_sub = {cid: (get_crypto_exchange(cid) or DEFAULT_EXCHANGE) for cid in subs}
+    needed_exchanges = set(exch_by_sub.values())
+
+    # Некрипто-активы считаем один раз — они не зависят от биржи
+    non_crypto = []
     for key, cfg in ASSETS.items():
+        if cfg["class"] == "crypto":
+            continue
         try:
             data = await asyncio.to_thread(_analyze, key)
             if data["direction"] != "WAIT":
-                to_send.append(data)
+                non_crypto.append(data)
                 logger.info(f"{cfg['name']}: {data['direction']} ({data['total_score']}/{MAX_SCORE})")
             else:
                 logger.info(f"{cfg['name']}: WAIT — пропущен")
@@ -820,13 +943,31 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка {cfg['name']}: {e}")
         await asyncio.sleep(1)
 
-    if not to_send:
-        logger.info("Нет сигналов — рассылка пропущена")
-        return
+    # Крипто-активы считаем один раз НА КАЖДУЮ нужную биржу среди подписчиков
+    crypto_by_exch = {}
+    for exch in needed_exchanges:
+        signals = []
+        for key, cfg in ASSETS.items():
+            if cfg["class"] != "crypto":
+                continue
+            try:
+                data = await asyncio.to_thread(_analyze, key, exch)
+                if data["direction"] != "WAIT":
+                    signals.append(data)
+                    logger.info(f"{cfg['name']} [{exch}]: {data['direction']} ({data['total_score']}/{MAX_SCORE})")
+                else:
+                    logger.info(f"{cfg['name']} [{exch}]: WAIT — пропущен")
+            except Exception as e:
+                logger.error(f"Ошибка {cfg['name']} [{exch}]: {e}")
+            await asyncio.sleep(1)
+        crypto_by_exch[exch] = signals
 
     dead = set()
     for cid in subs.copy():
         lang = get_language(cid) or "ru"
+        to_send = non_crypto + crypto_by_exch.get(exch_by_sub[cid], [])
+        if not to_send:
+            continue
         for d in to_send:
             try:
                 await context.bot.send_message(cid, fmt(d, lang, is_auto=True), parse_mode="Markdown")
@@ -850,6 +991,7 @@ def main():
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("help",        help_command))
     app.add_handler(CommandHandler("language",    language_command))
+    app.add_handler(CommandHandler("exchange",    exchange_command))
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 

@@ -5,3 +5,4 @@ yfinance
 python-dotenv
 psycopg2-binary
 feedparser
+ccxt
