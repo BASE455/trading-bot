@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import time
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -31,26 +32,29 @@ ADMIN_ID     = int(os.getenv("ADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 NEWS_WEIGHT = 2   # новости весят как 2 обычных индикатора
-MAX_SCORE   = 7   # 5 (техника) + 2 (новости)
-MIN_SCORE   = 5   # минимум для сигнала
+MAX_SCORE   = 8   # 6 (техника) + 2 (новости)
+MIN_SCORE   = 6   # минимум для сигнала (75%)
+
+ATR_SL_MULTIPLIER = 1.5  # стоп = 1.5×ATR, тейк = 2× от этого расстояния (R:R 2:1 сохраняем)
+
+DEFAULT_EXCHANGE = "binance"
 
 # ================================================================
 # АКТИВЫ
 # ================================================================
-# Для крипты (class="crypto") цена берётся с биржи, выбранной пользователем
-# (см. _fetch_ohlcv_dataframe). "ticker" для крипты — это резервный тикер
-# Yahoo Finance на случай, если ОБЕ крипто-биржи вдруг недоступны.
+# tp/sl больше не хранятся здесь — теперь считаются динамически через ATR,
+# одинаковая логика для всех активов, без ручной подстройки процентов.
 
 ASSETS = {
-    "btc":    {"ticker": "BTC-USD",  "crypto_symbol": "BTC/USDT", "name": "BTC/USD", "emoji": "₿",  "tp": 0.040, "sl": 0.020,  "class": "crypto"},
-    "eth":    {"ticker": "ETH-USD",  "crypto_symbol": "ETH/USDT", "name": "ETH/USD", "emoji": "Ξ",  "tp": 0.040, "sl": 0.020,  "class": "crypto"},
-    "sol":    {"ticker": "SOL-USD",  "crypto_symbol": "SOL/USDT", "name": "SOL/USD", "emoji": "◎",  "tp": 0.050, "sl": 0.025,  "class": "crypto"},
-    "gold":   {"ticker": "GC=F",     "name": "XAUUSD",  "emoji": "🥇", "tp": 0.015,  "sl": 0.0075, "class": "gold"},
-    "eur":    {"ticker": "EURUSD=X", "name": "EUR/USD", "emoji": "💶", "tp": 0.008,  "sl": 0.004,  "class": "forex"},
-    "nasdaq": {"ticker": "^IXIC",    "name": "NASDAQ",  "emoji": "📈", "tp": 0.020,  "sl": 0.010,  "class": "stock"},
-    "sp500":  {"ticker": "^GSPC",    "name": "S&P 500", "emoji": "🏛", "tp": 0.020,  "sl": 0.010,  "class": "stock"},
-    "aapl":   {"ticker": "AAPL",     "name": "AAPL",    "emoji": "🍎", "tp": 0.025,  "sl": 0.0125, "class": "stock"},
-    "tsla":   {"ticker": "TSLA",     "name": "TSLA",    "emoji": "🚗", "tp": 0.035,  "sl": 0.0175, "class": "stock"},
+    "btc":    {"ticker": "BTC-USD",  "crypto_symbol": "BTC/USDT", "name": "BTC/USD", "emoji": "₿",  "class": "crypto"},
+    "eth":    {"ticker": "ETH-USD",  "crypto_symbol": "ETH/USDT", "name": "ETH/USD", "emoji": "Ξ",  "class": "crypto"},
+    "sol":    {"ticker": "SOL-USD",  "crypto_symbol": "SOL/USDT", "name": "SOL/USD", "emoji": "◎",  "class": "crypto"},
+    "gold":   {"ticker": "GC=F",     "name": "XAUUSD",  "emoji": "🥇", "class": "gold"},
+    "eur":    {"ticker": "EURUSD=X", "name": "EUR/USD", "emoji": "💶", "class": "forex"},
+    "nasdaq": {"ticker": "^IXIC",    "name": "NASDAQ",  "emoji": "📈", "class": "stock"},
+    "sp500":  {"ticker": "^GSPC",    "name": "S&P 500", "emoji": "🏛", "class": "stock"},
+    "aapl":   {"ticker": "AAPL",     "name": "AAPL",    "emoji": "🍎", "class": "stock"},
+    "tsla":   {"ticker": "TSLA",     "name": "TSLA",    "emoji": "🚗", "class": "stock"},
 }
 
 PERIOD_BY_CLASS = {
@@ -60,10 +64,8 @@ PERIOD_BY_CLASS = {
     "stock":  "30d",
 }
 
-DEFAULT_EXCHANGE = "binance"
-
 # ================================================================
-# ХРАНИЛИЩЕ (подписчики + язык + биржа пользователя)
+# ХРАНИЛИЩЕ
 # ================================================================
 
 if DATABASE_URL:
@@ -76,7 +78,6 @@ if DATABASE_URL:
         with _conn() as c:
             with c.cursor() as cur:
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS subscribers (chat_id BIGINT PRIMARY KEY);
                     CREATE TABLE IF NOT EXISTS user_lang (
                         chat_id BIGINT PRIMARY KEY,
                         lang TEXT NOT NULL DEFAULT 'ru'
@@ -85,36 +86,27 @@ if DATABASE_URL:
                         chat_id BIGINT PRIMARY KEY,
                         exchange TEXT NOT NULL DEFAULT 'binance'
                     );
+                    CREATE TABLE IF NOT EXISTS tracked_signals (
+                        id SERIAL PRIMARY KEY,
+                        asset_key TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        entry DOUBLE PRECISION NOT NULL,
+                        take_profit DOUBLE PRECISION NOT NULL,
+                        stop_loss DOUBLE PRECISION NOT NULL,
+                        issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        status TEXT NOT NULL DEFAULT 'open',
+                        resolved_at TIMESTAMPTZ,
+                        resolved_price DOUBLE PRECISION
+                    );
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        chat_id BIGINT NOT NULL,
+                        asset_key TEXT NOT NULL,
+                        PRIMARY KEY (chat_id, asset_key)
+                    );
                 """)
             c.commit()
         logger.info("PostgreSQL инициализирован")
-
-    def get_subscribers() -> set:
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute("SELECT chat_id FROM subscribers")
-                return {r[0] for r in cur.fetchall()}
-
-    def add_subscriber(chat_id: int):
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO subscribers (chat_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                    (chat_id,)
-                )
-            c.commit()
-
-    def remove_subscriber(chat_id: int):
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute("DELETE FROM subscribers WHERE chat_id = %s", (chat_id,))
-            c.commit()
-
-    def count_subscribers() -> int:
-        with _conn() as c:
-            with c.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM subscribers")
-                return cur.fetchone()[0]
 
     def get_language(chat_id: int):
         with _conn() as c:
@@ -148,10 +140,109 @@ if DATABASE_URL:
                 """, (chat_id, exchange))
             c.commit()
 
+    def add_tracked_signal(asset_key, symbol, direction, entry, tp, sl):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO tracked_signals (asset_key, symbol, direction, entry, take_profit, stop_loss)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (asset_key, symbol, direction, entry, tp, sl))
+            c.commit()
+
+    def has_open_signal(asset_key) -> bool:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM tracked_signals WHERE asset_key=%s AND status='open' LIMIT 1",
+                    (asset_key,)
+                )
+                return cur.fetchone() is not None
+
+    def get_open_tracked_signals() -> list:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                    SELECT id, asset_key, direction, take_profit, stop_loss
+                    FROM tracked_signals WHERE status='open'
+                """)
+                rows = cur.fetchall()
+        return [
+            {"id": r[0], "asset_key": r[1], "direction": r[2], "take_profit": r[3], "stop_loss": r[4]}
+            for r in rows
+        ]
+
+    def resolve_tracked_signal(signal_id, status, resolved_price):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                    UPDATE tracked_signals SET status=%s, resolved_at=NOW(), resolved_price=%s
+                    WHERE id=%s
+                """, (status, resolved_price, signal_id))
+            c.commit()
+
+    def get_tracker_stats() -> dict:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT status, COUNT(*) FROM tracked_signals GROUP BY status")
+                rows = dict(cur.fetchall())
+        wins, losses, open_ = rows.get("win", 0), rows.get("loss", 0), rows.get("open", 0)
+        total = wins + losses
+        return {
+            "wins": wins, "losses": losses, "open": open_, "total_closed": total,
+            "win_rate": round(100 * wins / total, 1) if total > 0 else None,
+        }
+
+    def get_user_subscriptions(chat_id: int) -> set:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT asset_key FROM subscriptions WHERE chat_id=%s", (chat_id,))
+                return {r[0] for r in cur.fetchall()}
+
+    def toggle_subscription(chat_id: int, asset_key: str):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM subscriptions WHERE chat_id=%s AND asset_key=%s",
+                    (chat_id, asset_key)
+                )
+                if cur.fetchone():
+                    cur.execute(
+                        "DELETE FROM subscriptions WHERE chat_id=%s AND asset_key=%s",
+                        (chat_id, asset_key)
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO subscriptions (chat_id, asset_key) VALUES (%s, %s)",
+                        (chat_id, asset_key)
+                    )
+            c.commit()
+
+    def get_subscribers_for_asset(asset_key: str) -> set:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT chat_id FROM subscriptions WHERE asset_key=%s", (asset_key,))
+                return {r[0] for r in cur.fetchall()}
+
+    def get_all_subscribed_chat_ids() -> set:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT DISTINCT chat_id FROM subscriptions")
+                return {r[0] for r in cur.fetchall()}
+
+    def remove_all_subscriptions(chat_id: int):
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("DELETE FROM subscriptions WHERE chat_id=%s", (chat_id,))
+            c.commit()
+
+    def count_subscribers() -> int:
+        return len(get_all_subscribed_chat_ids())
+
 else:
-    SUBS_FILE = "subscribers.json"
     LANG_FILE = "languages.json"
     EXCHANGE_FILE = "exchanges.json"
+    SIGNALS_FILE = "tracked_signals.json"
+    SUBS_FILE = "subscriptions.json"  # {chat_id_str: [asset_key, ...]}
 
     def init_storage(): pass
 
@@ -161,11 +252,6 @@ else:
     def _save_j(f, d):
         with open(f, "w") as fp:
             json.dump(d, fp, ensure_ascii=False, indent=2)
-
-    def get_subscribers() -> set: return set(_load_j(SUBS_FILE, []))
-    def add_subscriber(cid: int): s = get_subscribers(); s.add(cid); _save_j(SUBS_FILE, list(s))
-    def remove_subscriber(cid: int): s = get_subscribers(); s.discard(cid); _save_j(SUBS_FILE, list(s))
-    def count_subscribers() -> int: return len(get_subscribers())
 
     def get_language(chat_id: int):
         return _load_j(LANG_FILE, {}).get(str(chat_id))
@@ -182,6 +268,76 @@ else:
         d = _load_j(EXCHANGE_FILE, {})
         d[str(chat_id)] = exchange
         _save_j(EXCHANGE_FILE, d)
+
+    def add_tracked_signal(asset_key, symbol, direction, entry, tp, sl):
+        signals = _load_j(SIGNALS_FILE, [])
+        new_id = max((s["id"] for s in signals), default=0) + 1
+        signals.append({
+            "id": new_id, "asset_key": asset_key, "symbol": symbol, "direction": direction,
+            "entry": entry, "take_profit": tp, "stop_loss": sl,
+            "issued_at": datetime.now().isoformat(), "status": "open",
+            "resolved_at": None, "resolved_price": None,
+        })
+        _save_j(SIGNALS_FILE, signals)
+
+    def has_open_signal(asset_key) -> bool:
+        return any(s["asset_key"] == asset_key and s["status"] == "open" for s in _load_j(SIGNALS_FILE, []))
+
+    def get_open_tracked_signals() -> list:
+        return [s for s in _load_j(SIGNALS_FILE, []) if s["status"] == "open"]
+
+    def resolve_tracked_signal(signal_id, status, resolved_price):
+        signals = _load_j(SIGNALS_FILE, [])
+        for s in signals:
+            if s["id"] == signal_id:
+                s["status"] = status
+                s["resolved_price"] = resolved_price
+                s["resolved_at"] = datetime.now().isoformat()
+                break
+        _save_j(SIGNALS_FILE, signals)
+
+    def get_tracker_stats() -> dict:
+        signals = _load_j(SIGNALS_FILE, [])
+        wins = sum(1 for s in signals if s["status"] == "win")
+        losses = sum(1 for s in signals if s["status"] == "loss")
+        open_ = sum(1 for s in signals if s["status"] == "open")
+        total = wins + losses
+        return {
+            "wins": wins, "losses": losses, "open": open_, "total_closed": total,
+            "win_rate": round(100 * wins / total, 1) if total > 0 else None,
+        }
+
+    def get_user_subscriptions(chat_id) -> set:
+        return set(_load_j(SUBS_FILE, {}).get(str(chat_id), []))
+
+    def toggle_subscription(chat_id, asset_key):
+        d = _load_j(SUBS_FILE, {})
+        key = str(chat_id)
+        current = set(d.get(key, []))
+        if asset_key in current:
+            current.discard(asset_key)
+        else:
+            current.add(asset_key)
+        if current:
+            d[key] = list(current)
+        else:
+            d.pop(key, None)
+        _save_j(SUBS_FILE, d)
+
+    def get_subscribers_for_asset(asset_key) -> set:
+        d = _load_j(SUBS_FILE, {})
+        return {int(cid) for cid, assets in d.items() if asset_key in assets}
+
+    def get_all_subscribed_chat_ids() -> set:
+        return {int(cid) for cid in _load_j(SUBS_FILE, {}).keys()}
+
+    def remove_all_subscriptions(chat_id):
+        d = _load_j(SUBS_FILE, {})
+        d.pop(str(chat_id), None)
+        _save_j(SUBS_FILE, d)
+
+    def count_subscribers() -> int:
+        return len(get_all_subscribed_chat_ids())
 
 # ================================================================
 # ТЕКСТЫ RU / EN
@@ -204,14 +360,16 @@ LANG = {
             "👋 Привет, {name}!\n\n"
             "🤖 *AlphaX Trade* — твой ИИ-помощник для трейдинга.\n\n"
             "📊 Слежу за: {assets_list}\n\n"
-            "Анализирую по *{max_score} факторам*: 5 технических индикаторов "
+            "Анализирую по *{max_score} факторам*: 6 технических индикаторов "
             "+ новости (весят как 2 индикатора).\n"
             "Сигнал только при *{min_score}/{max_score}* подтверждениях.\n\n"
-            "Каждый сигнал объясняю по пунктам и указываю время самих рыночных данных.\n\n"
+            "SL/TP считаются динамически от текущей волатильности (ATR), а не по "
+            "фиксированному проценту.\n\n"
             "📌 Команды:\n"
             "/signal — сигнал прямо сейчас\n"
-            "/subscribe — автосигналы каждые 2.5 часа\n"
-            "/unsubscribe — отключить\n"
+            "/subscribe — выбрать активы для автосигналов (раз в час)\n"
+            "/unsubscribe — отключить всё\n"
+            "/stats — реальная статистика бота (винрейт)\n"
             "/exchange — биржа для крипто-сигналов (Binance/Bybit)\n"
             "/language — сменить язык\n"
             "/help — как это работает"
@@ -220,35 +378,36 @@ LANG = {
         "help": (
             "🤖 *Как работает AlphaX Trade:*\n\n"
             "*Активы:*\n{assets_list}\n\n"
-            "*5 технических индикаторов (1 балл каждый):*\n"
+            "*6 технических индикаторов (1 балл каждый):*\n"
             "1. RSI — перекупленность/перепроданность\n"
             "2. MACD — направление импульса\n"
             "3. Bollinger Bands — цена на краю канала\n"
-            "4. Тренд 4H — глобальное направление рынка\n"
-            "5. Объём — деньги подтверждают движение\n\n"
+            "4. Тренд 4H — глобальное направление рынка (честный ресемплинг часовых свечей в 4-часовые)\n"
+            "5. Объём — деньги подтверждают движение\n"
+            "6. Stochastic — второе подтверждение перекупленности/перепроданности\n\n"
             "*📰 Новости (до 2 баллов):*\n"
-            "Читаю CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n"
-            "Если технических подтверждений уже 3-4 и новости совпадают по "
-            "направлению — этого хватит для сигнала, все 5 технических ждать не нужно.\n\n"
+            "Читаю CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n\n"
+            "*📏 SL/TP от ATR:* стоп ставится на 1.5×ATR от входа, тейк — вдвое дальше "
+            "(R:R 2:1 сохраняется). Это подстраивается под текущую волатильность каждого "
+            "актива, а не фиксированный % как раньше.\n\n"
             "🕐 Каждый сигнал показывает время самих рыночных данных — с их родным "
             "смещением UTC, а не время нашего сервера.\n\n"
-            "💱 Крипта (BTC, ETH, SOL) — данные с выбранной тобой биржи, "
-            "Binance или Bybit (/exchange). Если биржа вдруг недоступна — бот "
-            "автоматически переключится на другую, а затем на Yahoo Finance.\n"
-            "Золото, EUR/USD, NASDAQ, S&P 500, AAPL, TSLA — всегда Yahoo Finance, "
-            "у крипто-бирж таких инструментов просто нет.\n\n"
-            "⚠️ *Важно:* «медвежий» сигнал — не «плохо», это просто направление рынка вниз. "
-            "Бот одинаково даёт сигналы и на ПОКУПКУ (LONG), и на ПРОДАЖУ (SHORT).\n\n"
+            "💱 Крипта (BTC, ETH, SOL) — данные с выбранной тобой биржи (/exchange). "
+            "Золото, EUR/USD, NASDAQ, S&P 500, AAPL, TSLA — всегда Yahoo Finance.\n\n"
+            "📊 *Статистика (/stats):* бот сам проверяет каждый автосигнал — дошёл ли он "
+            "до тейка или до стопа — и честно показывает реальный винрейт, включая убытки.\n\n"
+            "⚠️ *Важно:* «медвежий» сигнал — не «плохо», это просто направление рынка вниз.\n\n"
             "✅ {min_score}/{max_score} = Хороший сигнал\n"
             "💪 {near_max}/{max_score} = Очень хороший\n"
             "🔥 {max_score}/{max_score} = Сильный\n\n"
             "/signal — сигнал сейчас\n"
-            "/subscribe — автосигналы каждые 2.5ч\n"
-            "/unsubscribe — отключить\n"
+            "/subscribe — выбрать активы для автосигналов (раз в час)\n"
+            "/unsubscribe — отключить всё\n"
+            "/stats — статистика бота\n"
             "/exchange — биржа для крипты\n"
             "/language — сменить язык\n\n"
-            "⚠️ Акции, NASDAQ и S&P 500 обновляются только в часы торгов биржи "
-            "(будни, US-время). Крипта и золото — почти круглосуточно.\n\n"
+            "⚠️ Акции, NASDAQ и S&P 500 обновляются только в часы торгов биржи. "
+            "Крипта и золото — почти круглосуточно.\n\n"
             "⚠️ Не является финансовым советом."
         ),
 
@@ -256,16 +415,23 @@ LANG = {
         "analyzing": "🔍 Анализирую рынок + читаю новости, 10-15 сек...",
         "error": "❌ Ошибка: {error}",
 
-        "sub_already": "✅ Ты уже подписан на автосигналы!",
-        "sub_activated": (
-            "✅ *Автосигналы активированы!*\n\n"
-            "Каждые 2.5 часа анализирую все активы.\n"
-            "Слабые сигналы пропускаю.\n"
-            "Новости проверяю автоматически.\n\n"
-            "Отключить: /unsubscribe"
+        "sub_menu_title": "Выбери активы, по которым хочешь получать автосигналы (раз в час). Нажимай, чтобы включить/выключить:",
+        "btn_done": "✅ Готово",
+        "sub_confirmed": "✅ Подписка обновлена!\n\nАктивов выбрано: {count}\nИзменить: /subscribe",
+        "sub_none_selected": "Подписка снята — ничего не выбрано.\n\nВключить снова: /subscribe",
+        "unsub_done": "❌ Все автосигналы отключены.\nВключить снова: /subscribe",
+
+        "stats_title": "📊 *Статистика AlphaX Trade*",
+        "stats_body": (
+            "Всего закрытых сигналов: {total_closed}\n"
+            "✅ Побед: {wins}\n"
+            "❌ Убытков: {losses}\n"
+            "📈 Винрейт: {win_rate}\n\n"
+            "⏳ Сейчас открыто: {open}\n\n"
+            "Статистика ведётся с момента запуска трекера — сигналы до этого не учитываются."
         ),
-        "unsub_done": "❌ Автосигналы отключены.\nВернуться: /subscribe",
-        "unsub_none": "Ты не был подписан.",
+        "stats_no_data": "Статистика пока пустая — трекер только что запущен. Первые результаты появятся, как только один из открытых сигналов дойдёт до тейка или стопа.",
+        "win_rate_na": "ещё нет закрытых сигналов",
 
         "header_signal": "📊 *Сигнал {symbol}*\n\n",
         "header_auto": "🔔 *Автосигнал {symbol}*\n\n",
@@ -284,6 +450,7 @@ LANG = {
         "lbl_entry": "📍 Точка входа",
         "lbl_tp": "🎯 Тейк-профит",
         "lbl_sl": "🛡 Стоп-лосс",
+        "lbl_atr": "📏 ATR (волатильность): `${atr}` — SL/TP считаются от неё",
         "lbl_reasons": "📋 *Почему этот сигнал:*",
         "lbl_rsi": "📈 RSI",
         "lbl_price": "💵 Цена",
@@ -293,8 +460,8 @@ LANG = {
         "lbl_disclaimer": "⚠️ Не является финансовым советом",
         "lbl_signal_time": "🕐 Время котировки: {time}",
 
-        "score_combined": "техника {tech}/5 + новости 📰 = *{total}/7*",
-        "score_tech_only": "техника {tech}/5 = *{total}/7* (новости не в счёт)",
+        "score_combined": "техника {tech}/6 + новости 📰 = *{total}/8*",
+        "score_tech_only": "техника {tech}/6 = *{total}/8* (новости не в счёт)",
         "need_min": "нужно минимум {min_score}/{max_score}",
 
         "conflict_warning": "\n\n⚠️ *Осторожно:* новости против сигнала ({news_text})",
@@ -309,6 +476,8 @@ LANG = {
         "reason_trend_down": "Старший таймфрейм (4H): EMA20 ниже EMA50 — общий тренд вниз",
         "reason_vol_bull": "Объём торгов ×{ratio} от среднего — крупные игроки заходят в рост",
         "reason_vol_bear": "Объём торгов ×{ratio} от среднего — крупные игроки продают",
+        "reason_stoch_oversold": "Stochastic = {stoch} (ниже 20 — перепродан, второе подтверждение разворота вверх)",
+        "reason_stoch_overbought": "Stochastic = {stoch} (выше 80 — перекуплен, второе подтверждение разворота вниз)",
         "reason_news_buy": "Новости: {news_text} — усиливают сигнал на покупку",
         "reason_news_sell": "Новости: {news_text} — усиливают сигнал на продажу",
 
@@ -332,14 +501,15 @@ LANG = {
             "👋 Hi, {name}!\n\n"
             "🤖 *AlphaX Trade* — your AI trading assistant.\n\n"
             "📊 Tracking: {assets_list}\n\n"
-            "I analyze using *{max_score} factors*: 5 technical indicators "
+            "I analyze using *{max_score} factors*: 6 technical indicators "
             "+ news (weighted as 2 indicators).\n"
             "A signal fires only at *{min_score}/{max_score}* confirmations.\n\n"
-            "Every signal is explained point by point, with the actual market data time.\n\n"
+            "SL/TP are computed dynamically from current volatility (ATR), not a fixed percent.\n\n"
             "📌 Commands:\n"
             "/signal — get a signal right now\n"
-            "/subscribe — auto-signals every 2.5 hours\n"
-            "/unsubscribe — turn off\n"
+            "/subscribe — choose assets for auto-signals (hourly)\n"
+            "/unsubscribe — turn everything off\n"
+            "/stats — the bot's real track record (win rate)\n"
             "/exchange — exchange for crypto signals (Binance/Bybit)\n"
             "/language — change language\n"
             "/help — how it works"
@@ -348,35 +518,36 @@ LANG = {
         "help": (
             "🤖 *How AlphaX Trade works:*\n\n"
             "*Assets:*\n{assets_list}\n\n"
-            "*5 technical indicators (1 point each):*\n"
+            "*6 technical indicators (1 point each):*\n"
             "1. RSI — overbought/oversold\n"
             "2. MACD — momentum direction\n"
             "3. Bollinger Bands — price at the edge of the channel\n"
-            "4. 4H trend — overall market direction\n"
-            "5. Volume — money confirming the move\n\n"
+            "4. 4H trend — overall market direction (real resampling of hourly candles into 4H)\n"
+            "5. Volume — money confirming the move\n"
+            "6. Stochastic — second confirmation of overbought/oversold\n\n"
             "*📰 News (up to 2 points):*\n"
-            "I read CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n"
-            "If there are already 3-4 technical confirmations and news agrees with the "
-            "direction — that's enough for a signal, you don't need all 5 technical ones.\n\n"
+            "I read CoinTelegraph, CoinDesk, Reuters, MarketWatch, Kitco.\n\n"
+            "*📏 ATR-based SL/TP:* stop is placed 1.5×ATR from entry, target twice that "
+            "distance (2:1 R:R kept). This adapts to each asset's current volatility "
+            "instead of a fixed percent like before.\n\n"
             "🕐 Every signal shows the time of the actual market data — with its own "
             "UTC offset, not our server's time.\n\n"
-            "💱 Crypto (BTC, ETH, SOL) — data from your chosen exchange, "
-            "Binance or Bybit (/exchange). If that exchange is unavailable, the bot "
-            "automatically switches to the other one, then to Yahoo Finance.\n"
-            "Gold, EUR/USD, NASDAQ, S&P 500, AAPL, TSLA — always Yahoo Finance, "
-            "crypto exchanges simply don't have these instruments.\n\n"
-            "⚠️ *Important:* a «bearish» signal isn't «bad» — it's just a downward market direction. "
-            "The bot gives signals for both BUY (LONG) and SELL (SHORT) equally.\n\n"
+            "💱 Crypto (BTC, ETH, SOL) — data from your chosen exchange (/exchange). "
+            "Gold, EUR/USD, NASDAQ, S&P 500, AAPL, TSLA — always Yahoo Finance.\n\n"
+            "📊 *Stats (/stats):* the bot checks every auto-signal itself — whether it hit "
+            "take-profit or stop-loss — and shows the real win rate honestly, losses included.\n\n"
+            "⚠️ *Important:* a «bearish» signal isn't «bad» — it's just a downward market direction.\n\n"
             "✅ {min_score}/{max_score} = Good signal\n"
             "💪 {near_max}/{max_score} = Very good\n"
             "🔥 {max_score}/{max_score} = Strong\n\n"
             "/signal — get a signal now\n"
-            "/subscribe — auto-signals every 2.5h\n"
-            "/unsubscribe — turn off\n"
+            "/subscribe — choose assets for auto-signals (hourly)\n"
+            "/unsubscribe — turn everything off\n"
+            "/stats — bot's stats\n"
             "/exchange — crypto data exchange\n"
             "/language — change language\n\n"
-            "⚠️ Stocks, NASDAQ and S&P 500 only update during exchange trading hours "
-            "(weekdays, US time). Crypto and gold — nearly 24/7.\n\n"
+            "⚠️ Stocks, NASDAQ and S&P 500 only update during exchange trading hours. "
+            "Crypto and gold — nearly 24/7.\n\n"
             "⚠️ Not financial advice."
         ),
 
@@ -384,16 +555,23 @@ LANG = {
         "analyzing": "🔍 Analyzing the market + reading the news, 10-15 sec...",
         "error": "❌ Error: {error}",
 
-        "sub_already": "✅ You're already subscribed to auto-signals!",
-        "sub_activated": (
-            "✅ *Auto-signals activated!*\n\n"
-            "I analyze all assets every 2.5 hours.\n"
-            "Weak signals are skipped.\n"
-            "News is checked automatically.\n\n"
-            "Turn off: /unsubscribe"
+        "sub_menu_title": "Choose which assets you want hourly auto-signals for. Tap to toggle on/off:",
+        "btn_done": "✅ Done",
+        "sub_confirmed": "✅ Subscriptions updated!\n\nAssets selected: {count}\nChange: /subscribe",
+        "sub_none_selected": "Subscription cleared — nothing selected.\n\nTurn back on: /subscribe",
+        "unsub_done": "❌ All auto-signals turned off.\nTurn back on: /subscribe",
+
+        "stats_title": "📊 *AlphaX Trade Stats*",
+        "stats_body": (
+            "Total closed signals: {total_closed}\n"
+            "✅ Wins: {wins}\n"
+            "❌ Losses: {losses}\n"
+            "📈 Win rate: {win_rate}\n\n"
+            "⏳ Currently open: {open}\n\n"
+            "Tracking started when this update went live — earlier signals aren't included."
         ),
-        "unsub_done": "❌ Auto-signals turned off.\nCome back: /subscribe",
-        "unsub_none": "You weren't subscribed.",
+        "stats_no_data": "No stats yet — the tracker just started. First results will show up once an open signal hits take-profit or stop-loss.",
+        "win_rate_na": "no closed signals yet",
 
         "header_signal": "📊 *{symbol} Signal*\n\n",
         "header_auto": "🔔 *{symbol} Auto-signal*\n\n",
@@ -412,6 +590,7 @@ LANG = {
         "lbl_entry": "📍 Entry point",
         "lbl_tp": "🎯 Take-profit",
         "lbl_sl": "🛡 Stop-loss",
+        "lbl_atr": "📏 ATR (volatility): `${atr}` — SL/TP are based on this",
         "lbl_reasons": "📋 *Why this signal:*",
         "lbl_rsi": "📈 RSI",
         "lbl_price": "💵 Price",
@@ -421,8 +600,8 @@ LANG = {
         "lbl_disclaimer": "⚠️ Not financial advice",
         "lbl_signal_time": "🕐 Quote time: {time}",
 
-        "score_combined": "technicals {tech}/5 + news 📰 = *{total}/7*",
-        "score_tech_only": "technicals {tech}/5 = *{total}/7* (news not counted)",
+        "score_combined": "technicals {tech}/6 + news 📰 = *{total}/8*",
+        "score_tech_only": "technicals {tech}/6 = *{total}/8* (news not counted)",
         "need_min": "need at least {min_score}/{max_score}",
 
         "conflict_warning": "\n\n⚠️ *Careful:* news contradicts the signal ({news_text})",
@@ -437,6 +616,8 @@ LANG = {
         "reason_trend_down": "Higher timeframe (4H): EMA20 below EMA50 — overall trend is down",
         "reason_vol_bull": "Trading volume ×{ratio} of average — large players are buying the rally",
         "reason_vol_bear": "Trading volume ×{ratio} of average — large players are selling",
+        "reason_stoch_oversold": "Stochastic = {stoch} (below 20 — oversold, second confirmation of a reversal up)",
+        "reason_stoch_overbought": "Stochastic = {stoch} (above 80 — overbought, second confirmation of a reversal down)",
         "reason_news_buy": "News: {news_text} — reinforces the buy signal",
         "reason_news_sell": "News: {news_text} — reinforces the sell signal",
 
@@ -456,7 +637,7 @@ def render(lang: str, key: str, **params) -> str:
 # ================================================================
 
 _news_cache: dict = {}
-NEWS_TTL = 1800  # кэш на 30 минут
+NEWS_TTL = 1800
 
 FEEDS_BY_CLASS = {
     "crypto": ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/"],
@@ -481,10 +662,6 @@ BEARISH_WORDS = [
 ]
 
 def _fetch_news(symbol: str, asset_class: str) -> tuple[int, str, dict]:
-    """
-    Возвращает (score, ключ_шаблона, параметры) — БЕЗ привязки к языку.
-    score: +1 бычьи слова перевешивают, -1 медвежьи перевешивают, 0 нейтрально.
-    """
     now = time.time()
     if symbol in _news_cache:
         ts, score, key, params = _news_cache[symbol]
@@ -529,20 +706,15 @@ def _fetch_crypto_ohlcv(symbol: str, exchange_name: str) -> pd.DataFrame:
     raw = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=200)
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df.set_index("ts")[["close", "volume"]]
+    return df.set_index("ts")[["high", "low", "close", "volume"]]
 
 def _fetch_yahoo_ohlcv(cfg: dict) -> pd.DataFrame:
     period = PERIOD_BY_CLASS.get(cfg["class"], "7d")
     df = yf.Ticker(cfg["ticker"]).history(period=period, interval="1h")
     df.columns = [c.lower() for c in df.columns]
-    return df[["close", "volume"]]
+    return df[["high", "low", "close", "volume"]]
 
 def _fetch_ohlcv_dataframe(cfg: dict, exchange_pref: str = None) -> pd.DataFrame:
-    """
-    Крипта: пробуем предпочтение пользователя, при сбое — вторую крипто-биржу,
-    и только потом Yahoo как последний резерв. Остальные классы — сразу Yahoo,
-    у бирж этих инструментов просто нет.
-    """
     if cfg["class"] == "crypto":
         preferred = exchange_pref or DEFAULT_EXCHANGE
         other = "bybit" if preferred == "binance" else "binance"
@@ -567,102 +739,98 @@ def _get_bbands(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     l = [c for c in bb.columns if c.startswith("BBL")][0]
     return bb[u], bb[l]
 
-def _format_market_time(ts) -> str:
-    """
-    ts — pandas Timestamp последней свечи (уже привязан к часовому поясу
-    конкретного рынка/биржи). Показываем как есть, с явным смещением UTC —
-    это время самих данных, а не время сервера бота.
-    """
-    if ts.tzinfo is None:
-        return ts.strftime("%d.%m %H:%M")
-    offset = ts.utcoffset()
-    if offset is None:
-        return ts.strftime("%d.%m %H:%M")
-    total_minutes = int(offset.total_seconds() // 60)
-    sign = "+" if total_minutes >= 0 else "-"
-    hh, mm = divmod(abs(total_minutes), 60)
-    offset_str = f"UTC{sign}{hh}" + (f":{mm:02d}" if mm else "")
-    return f"{ts.strftime('%d.%m %H:%M')} ({offset_str})"
+def _get_stoch_k(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    st = ta.stoch(high, low, close)
+    if st is None or st.empty:
+        return pd.Series([50.0] * len(close), index=close.index)
+    k_col = [c for c in st.columns if c.startswith("STOCHk")][0]
+    return st[k_col]
 
-def _score_technical(rsi, macd, macd_s, price, bbu, bbl, trend_bull, vol_ratio):
+def _resample_4h_trend(df: pd.DataFrame) -> bool:
+    """Честный ресемплинг часовых свечей в 4-часовые для тренда, без доп. запросов."""
+    df_4h = df["close"].resample("4h").last().dropna()
+    if len(df_4h) < 20:
+        e20 = ta.ema(df["close"], 20)
+        e50 = ta.ema(df["close"], 50)
+        return bool(e20.iloc[-1] > e50.iloc[-1])
+    e20 = ta.ema(df_4h, 20)
+    e50 = ta.ema(df_4h, 50)
+    return bool(e20.iloc[-1] > e50.iloc[-1])
+
+def _score_technical(rsi, macd, macd_s, price, bbu, bbl, trend_bull, vol_ratio, stoch_k):
     """Каждый индикатор возвращает (ключ_шаблона, параметры), а не готовый текст."""
     bs, ss = 0, 0
     br, sr = [], []
 
     if rsi < 30:
-        bs += 1
-        br.append(("reason_rsi_oversold", {"rsi": rsi}))
+        bs += 1; br.append(("reason_rsi_oversold", {"rsi": rsi}))
     elif rsi > 70:
-        ss += 1
-        sr.append(("reason_rsi_overbought", {"rsi": rsi}))
+        ss += 1; sr.append(("reason_rsi_overbought", {"rsi": rsi}))
 
     if macd > macd_s:
-        bs += 1
-        br.append(("reason_macd_bull", {}))
+        bs += 1; br.append(("reason_macd_bull", {}))
     else:
-        ss += 1
-        sr.append(("reason_macd_bear", {}))
+        ss += 1; sr.append(("reason_macd_bear", {}))
 
     if price <= bbl * 1.005:
-        bs += 1
-        br.append(("reason_bb_lower", {}))
+        bs += 1; br.append(("reason_bb_lower", {}))
     elif price >= bbu * 0.995:
-        ss += 1
-        sr.append(("reason_bb_upper", {}))
+        ss += 1; sr.append(("reason_bb_upper", {}))
 
     if trend_bull:
-        bs += 1
-        br.append(("reason_trend_up", {}))
+        bs += 1; br.append(("reason_trend_up", {}))
     else:
-        ss += 1
-        sr.append(("reason_trend_down", {}))
+        ss += 1; sr.append(("reason_trend_down", {}))
 
     if vol_ratio >= 1.5:
         if bs >= ss:
-            bs += 1
-            br.append(("reason_vol_bull", {"ratio": round(vol_ratio, 1)}))
+            bs += 1; br.append(("reason_vol_bull", {"ratio": round(vol_ratio, 1)}))
         else:
-            ss += 1
-            sr.append(("reason_vol_bear", {"ratio": round(vol_ratio, 1)}))
+            ss += 1; sr.append(("reason_vol_bear", {"ratio": round(vol_ratio, 1)}))
+
+    if stoch_k < 20:
+        bs += 1; br.append(("reason_stoch_oversold", {"stoch": stoch_k}))
+    elif stoch_k > 80:
+        ss += 1; sr.append(("reason_stoch_overbought", {"stoch": stoch_k}))
 
     return bs, ss, br, sr
 
 def _analyze(asset_key: str, exchange_pref: str = None) -> dict:
     """
-    Анализ актива: 5 технических индикаторов + новости (вес x2, максимум 7 баллов).
+    Анализ актива: 6 технических индикаторов + новости (вес x2, максимум 8 баллов).
+    SL/TP считаются от ATR, а не от фиксированного процента.
     Результат полностью язык-независим — рендер под конкретный язык делает fmt().
-    exchange_pref используется только для активов класса "crypto".
-    Выполняется в отдельном потоке через asyncio.to_thread — не блокирует бота.
     """
     cfg = ASSETS[asset_key]
     display_symbol = cfg["name"]
-    tp, sl = cfg["tp"], cfg["sl"]
 
     df = _fetch_ohlcv_dataframe(cfg, exchange_pref)
     if df.empty:
         raise ValueError(f"Нет данных: {display_symbol}")
 
-    bar_time = df.index[-1]  # время последней свечи — родное для этого источника
+    bar_time = df.index[-1]
+    trend = _resample_4h_trend(df)
 
-    df["e20"]  = ta.ema(df["close"], 20)
-    df["e50"]  = ta.ema(df["close"], 50)
-    trend      = bool(df.iloc[-1]["e20"] > df.iloc[-1]["e50"])
-    df["rsi"]  = ta.rsi(df["close"], 14)
-    m          = ta.macd(df["close"])
+    df["rsi"] = ta.rsi(df["close"], 14)
+    m = ta.macd(df["close"])
     df["macd"] = m["MACD_12_26_9"]
-    df["ms"]   = m["MACDs_12_26_9"]
+    df["ms"] = m["MACDs_12_26_9"]
     df["bbu"], df["bbl"] = _get_bbands(df["close"])
-    df["vm"]   = ta.sma(df["volume"], 20)
+    df["vm"] = ta.sma(df["volume"], 20)
+    df["stoch_k"] = _get_stoch_k(df["high"], df["low"], df["close"])
+    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
 
     last = df.iloc[-1]
-    p    = float(last["close"])
-    rsi  = round(float(last["rsi"]), 2)
-    vm   = float(last["vm"]) or 1.0
-    vr   = float(last["volume"]) / vm
+    p = float(last["close"])
+    rsi = round(float(last["rsi"]), 2)
+    vm = float(last["vm"]) or 1.0
+    vr = float(last["volume"]) / vm
+    stoch_k = round(float(last["stoch_k"]), 1)
+    current_atr = float(last["atr"])
 
     bs, ss, br, sr = _score_technical(
         rsi, float(last["macd"]), float(last["ms"]),
-        p, float(last["bbu"]), float(last["bbl"]), trend, vr
+        p, float(last["bbu"]), float(last["bbl"]), trend, vr, stoch_k
     )
     tech_bs, tech_ss = bs, ss
 
@@ -672,10 +840,14 @@ def _analyze(asset_key: str, exchange_pref: str = None) -> dict:
     elif news_score < 0:
         ss += NEWS_WEIGHT
 
+    sl_distance = current_atr * ATR_SL_MULTIPLIER
+    tp_distance = sl_distance * 2  # R:R 2:1, как и раньше
+
     common = {
         "symbol": display_symbol,
         "rsi": rsi,
         "entry": round(p, 2),
+        "atr": round(current_atr, 4),
         "news_key": news_key,
         "news_params": news_params,
         "data_time": bar_time,
@@ -683,11 +855,10 @@ def _analyze(asset_key: str, exchange_pref: str = None) -> dict:
 
     if bs >= MIN_SCORE and bs > ss:
         return {
-            **common,
-            "direction": "LONG",
+            **common, "direction": "LONG",
             "total_score": bs, "tech_score": tech_bs,
-            "take_profit": round(p * (1 + tp), 2),
-            "stop_loss": round(p * (1 - sl), 2),
+            "take_profit": round(p + tp_distance, 2),
+            "stop_loss": round(p - sl_distance, 2),
             "reasons": br,
             "news_conflicts": news_score < 0,
             "news_helped": news_score > 0,
@@ -695,11 +866,10 @@ def _analyze(asset_key: str, exchange_pref: str = None) -> dict:
 
     if ss >= MIN_SCORE and ss > bs:
         return {
-            **common,
-            "direction": "SHORT",
+            **common, "direction": "SHORT",
             "total_score": ss, "tech_score": tech_ss,
-            "take_profit": round(p * (1 - tp), 2),
-            "stop_loss": round(p * (1 + sl), 2),
+            "take_profit": round(p - tp_distance, 2),
+            "stop_loss": round(p + sl_distance, 2),
             "reasons": sr,
             "news_conflicts": news_score > 0,
             "news_helped": news_score < 0,
@@ -724,6 +894,18 @@ def _analyze(asset_key: str, exchange_pref: str = None) -> dict:
 # ================================================================
 # ФОРМАТИРОВАНИЕ — единственное место, где нужен язык
 # ================================================================
+
+def _format_market_time(ts) -> str:
+    if ts.tzinfo is None:
+        return ts.strftime("%d.%m %H:%M")
+    offset = ts.utcoffset()
+    if offset is None:
+        return ts.strftime("%d.%m %H:%M")
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hh, mm = divmod(abs(total_minutes), 60)
+    offset_str = f"UTC{sign}{hh}" + (f":{mm:02d}" if mm else "")
+    return f"{ts.strftime('%d.%m %H:%M')} ({offset_str})"
 
 def fmt(data: dict, lang: str, is_auto: bool = False) -> str:
     t = LANG[lang]
@@ -758,6 +940,7 @@ def fmt(data: dict, lang: str, is_auto: bool = False) -> str:
         reasons_block = "\n".join(f"{i+1}. {r}" for i, r in enumerate(rendered))
 
         conflict = t["conflict_warning"].format(news_text=news_text) if data["news_conflicts"] else ""
+        atr_line = t["lbl_atr"].format(atr=data["atr"])
 
         return (
             f"{header}"
@@ -765,7 +948,8 @@ def fmt(data: dict, lang: str, is_auto: bool = False) -> str:
             f"{t['lbl_strength']}: {strength} — {score_line}\n\n"
             f"{t['lbl_entry']}: `${data['entry']}`\n"
             f"{t['lbl_tp']}: `${data['take_profit']}`\n"
-            f"{t['lbl_sl']}: `${data['stop_loss']}`\n\n"
+            f"{t['lbl_sl']}: `${data['stop_loss']}`\n"
+            f"{atr_line}\n\n"
             f"{t['lbl_reasons']}\n{reasons_block}"
             f"{conflict}\n\n"
             f"{t['lbl_rsi']}: `{data['rsi']}`\n"
@@ -787,7 +971,38 @@ def fmt(data: dict, lang: str, is_auto: bool = False) -> str:
     )
 
 # ================================================================
-# ВЫБОР ЯЗЫКА / БИРЖИ
+# ТРЕКЕР ВИНРЕЙТА
+# ================================================================
+
+async def check_open_signals():
+    open_signals = get_open_tracked_signals()
+    if not open_signals:
+        return
+
+    for sig in open_signals:
+        cfg = ASSETS.get(sig["asset_key"])
+        if not cfg:
+            continue
+        try:
+            df = await asyncio.to_thread(_fetch_ohlcv_dataframe, cfg, DEFAULT_EXCHANGE)
+            current_price = float(df.iloc[-1]["close"])
+        except Exception as e:
+            logger.error(f"Не смог проверить цену {sig['asset_key']}: {e}")
+            continue
+
+        if sig["direction"] == "LONG":
+            if current_price >= sig["take_profit"]:
+                resolve_tracked_signal(sig["id"], "win", current_price)
+            elif current_price <= sig["stop_loss"]:
+                resolve_tracked_signal(sig["id"], "loss", current_price)
+        else:
+            if current_price <= sig["take_profit"]:
+                resolve_tracked_signal(sig["id"], "win", current_price)
+            elif current_price >= sig["stop_loss"]:
+                resolve_tracked_signal(sig["id"], "loss", current_price)
+
+# ================================================================
+# ВЫБОР ЯЗЫКА / БИРЖИ / ПОДПИСОК
 # ================================================================
 
 def _lang_keyboard() -> InlineKeyboardMarkup:
@@ -801,6 +1016,15 @@ def _exchange_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(LANG["ru"]["btn_binance"], callback_data="exch_binance"),
         InlineKeyboardButton(LANG["ru"]["btn_bybit"], callback_data="exch_bybit"),
     ]])
+
+def _subscription_keyboard(subscribed: set, lang: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for key, cfg in ASSETS.items():
+        mark = "☑️" if key in subscribed else "⬜"
+        buttons.append(InlineKeyboardButton(f"{mark} {cfg['emoji']} {cfg['name']}", callback_data=f"subtoggle_{key}"))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(LANG[lang]["btn_done"], callback_data="subdone")])
+    return InlineKeyboardMarkup(rows)
 
 async def _send_start(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user, lang: str):
     assets_list = ", ".join(f"{c['emoji']}{c['name']}" for c in ASSETS.values())
@@ -846,23 +1070,33 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     await update.message.reply_text(LANG[lang]["choose_asset"], reply_markup=InlineKeyboardMarkup(kb))
 
-async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.message.chat_id
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_language(update.effective_user.id) or "ru"
-    if cid in get_subscribers():
-        await update.message.reply_text(LANG[lang]["sub_already"])
-    else:
-        add_subscriber(cid)
-        await update.message.reply_text(LANG[lang]["sub_activated"], parse_mode="Markdown")
+    cid = update.message.chat_id
+    subscribed = get_user_subscriptions(cid)
+    await update.message.reply_text(
+        LANG[lang]["sub_menu_title"],
+        reply_markup=_subscription_keyboard(subscribed, lang)
+    )
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.message.chat_id
     lang = get_language(update.effective_user.id) or "ru"
-    if cid in get_subscribers():
-        remove_subscriber(cid)
-        await update.message.reply_text(LANG[lang]["unsub_done"])
-    else:
-        await update.message.reply_text(LANG[lang]["unsub_none"])
+    remove_all_subscriptions(cid)
+    await update.message.reply_text(LANG[lang]["unsub_done"])
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_language(update.effective_user.id) or "ru"
+    s = get_tracker_stats()
+    if s["total_closed"] == 0 and s["open"] == 0:
+        await update.message.reply_text(LANG[lang]["stats_no_data"])
+        return
+    win_rate_str = f"{s['win_rate']}%" if s["win_rate"] is not None else LANG[lang]["win_rate_na"]
+    text = LANG[lang]["stats_title"] + "\n\n" + LANG[lang]["stats_body"].format(
+        total_closed=s["total_closed"], wins=s["wins"], losses=s["losses"],
+        win_rate=win_rate_str, open=s["open"]
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -887,6 +1121,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(LANG[lang][key])
         return
 
+    if q.data.startswith("subtoggle_"):
+        asset_key = q.data.removeprefix("subtoggle_")
+        if asset_key not in ASSETS:
+            return
+        cid = q.message.chat_id
+        toggle_subscription(cid, asset_key)
+        lang = get_language(q.from_user.id) or "ru"
+        subscribed = get_user_subscriptions(cid)
+        await q.edit_message_reply_markup(reply_markup=_subscription_keyboard(subscribed, lang))
+        return
+
+    if q.data == "subdone":
+        lang = get_language(q.from_user.id) or "ru"
+        cid = q.message.chat_id
+        subscribed = get_user_subscriptions(cid)
+        if subscribed:
+            await q.edit_message_text(LANG[lang]["sub_confirmed"].format(count=len(subscribed)))
+        else:
+            await q.edit_message_text(LANG[lang]["sub_none_selected"])
+        return
+
     if q.data.startswith("sig_"):
         asset_key = q.data.removeprefix("sig_")
         if asset_key not in ASSETS:
@@ -907,67 +1162,86 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = count_subscribers()
     await update.message.reply_text(
         f"📊 *Статистика AlphaX Trade*\n\n"
-        f"👥 Подписчиков: *{n}*\n"
+        f"👥 Уникальных подписчиков: *{n}*\n"
         f"📈 Активов в анализе: *{len(ASSETS)}*",
         parse_mode="Markdown"
     )
 
 # ================================================================
-# АВТОСИГНАЛЫ
+# АВТОСИГНАЛЫ — раз в час, с учётом подписки по конкретным активам
 # ================================================================
 
 async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
-    subs = get_subscribers()
-    if not subs:
-        logger.info("Нет подписчиков — пропускаем")
-        return
+    await check_open_signals()
 
-    logger.info(f"Автосигналы: {len(subs)} подписчиков, {len(ASSETS)} активов")
-
-    exch_by_sub = {cid: (get_crypto_exchange(cid) or DEFAULT_EXCHANGE) for cid in subs}
-    needed_exchanges = set(exch_by_sub.values())
-
-    # Некрипто-активы считаем один раз — они не зависят от биржи
-    non_crypto = []
+    # Не-крипто активы считаем один раз — не зависят от биржи пользователя
+    non_crypto_signals = {}
     for key, cfg in ASSETS.items():
         if cfg["class"] == "crypto":
             continue
         try:
             data = await asyncio.to_thread(_analyze, key)
             if data["direction"] != "WAIT":
-                non_crypto.append(data)
+                non_crypto_signals[key] = data
                 logger.info(f"{cfg['name']}: {data['direction']} ({data['total_score']}/{MAX_SCORE})")
+                if not has_open_signal(key):
+                    add_tracked_signal(key, data["symbol"], data["direction"],
+                                        data["entry"], data["take_profit"], data["stop_loss"])
             else:
                 logger.info(f"{cfg['name']}: WAIT — пропущен")
         except Exception as e:
             logger.error(f"Ошибка {cfg['name']}: {e}")
         await asyncio.sleep(1)
 
-    # Крипто-активы считаем один раз НА КАЖДУЮ нужную биржу среди подписчиков
-    crypto_by_exch = {}
+    # Для крипты нужны только те биржи, что реально выбраны подписчиками крипто-активов
+    crypto_keys = [k for k, c in ASSETS.items() if c["class"] == "crypto"]
+    subscriber_exchanges = set()
+    for key in crypto_keys:
+        for cid in get_subscribers_for_asset(key):
+            subscriber_exchanges.add(get_crypto_exchange(cid) or DEFAULT_EXCHANGE)
+    needed_exchanges = subscriber_exchanges or {DEFAULT_EXCHANGE}  # трекер винрейта работает даже без подписчиков
+
+    crypto_signals_by_exch = {}
     for exch in needed_exchanges:
-        signals = []
-        for key, cfg in ASSETS.items():
-            if cfg["class"] != "crypto":
-                continue
+        signals = {}
+        for key in crypto_keys:
+            cfg = ASSETS[key]
             try:
                 data = await asyncio.to_thread(_analyze, key, exch)
                 if data["direction"] != "WAIT":
-                    signals.append(data)
+                    signals[key] = data
                     logger.info(f"{cfg['name']} [{exch}]: {data['direction']} ({data['total_score']}/{MAX_SCORE})")
+                    if exch == DEFAULT_EXCHANGE and not has_open_signal(key):
+                        add_tracked_signal(key, data["symbol"], data["direction"],
+                                            data["entry"], data["take_profit"], data["stop_loss"])
                 else:
                     logger.info(f"{cfg['name']} [{exch}]: WAIT — пропущен")
             except Exception as e:
                 logger.error(f"Ошибка {cfg['name']} [{exch}]: {e}")
             await asyncio.sleep(1)
-        crypto_by_exch[exch] = signals
+        crypto_signals_by_exch[exch] = signals
+
+    all_chat_ids = get_all_subscribed_chat_ids()
+    if not all_chat_ids:
+        logger.info("Нет подписчиков — рассылка пропущена (проверка сигналов уже прошла)")
+        return
 
     dead = set()
-    for cid in subs.copy():
+    for cid in all_chat_ids:
         lang = get_language(cid) or "ru"
-        to_send = non_crypto + crypto_by_exch.get(exch_by_sub[cid], [])
-        if not to_send:
-            continue
+        my_assets = get_user_subscriptions(cid)
+        exch = get_crypto_exchange(cid) or DEFAULT_EXCHANGE
+        to_send = []
+        for key in my_assets:
+            cfg = ASSETS.get(key)
+            if not cfg:
+                continue
+            if cfg["class"] == "crypto":
+                d = crypto_signals_by_exch.get(exch, {}).get(key)
+            else:
+                d = non_crypto_signals.get(key)
+            if d:
+                to_send.append(d)
         for d in to_send:
             try:
                 await context.bot.send_message(cid, fmt(d, lang, is_auto=True), parse_mode="Markdown")
@@ -975,7 +1249,7 @@ async def send_auto_signals(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Ошибка отправки {cid}: {e}")
                 dead.add(cid)
     for cid in dead:
-        remove_subscriber(cid)
+        remove_all_subscriptions(cid)
 
 # ================================================================
 # ЗАПУСК
@@ -987,15 +1261,16 @@ def main():
 
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("signal",      signal_command))
-    app.add_handler(CommandHandler("subscribe",   subscribe))
+    app.add_handler(CommandHandler("subscribe",   subscribe_command))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    app.add_handler(CommandHandler("stats",       stats_command))
     app.add_handler(CommandHandler("help",        help_command))
     app.add_handler(CommandHandler("language",    language_command))
     app.add_handler(CommandHandler("exchange",    exchange_command))
     app.add_handler(CommandHandler("users",       users_command))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    app.job_queue.run_repeating(send_auto_signals, interval=9000, first=10)
+    app.job_queue.run_repeating(send_auto_signals, interval=3600, first=10)  # раз в час
 
     mode = "PostgreSQL ☁️" if DATABASE_URL else "JSON (локально)"
     print(f"✅ AlphaX Trade запущен! Активов: {len(ASSETS)}. Хранилище: {mode}")
