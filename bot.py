@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -36,6 +36,7 @@ MAX_SCORE   = 8   # 6 (техника) + 2 (новости)
 MIN_SCORE   = 6   # минимум для сигнала (75%)
 
 ATR_SL_MULTIPLIER = 1.5  # стоп = 1.5×ATR, тейк = 2× от этого расстояния (R:R 2:1 сохраняем)
+SIGNAL_MAX_HOURS  = 24   # если сигнал за это время не дошёл ни до тейка, ни до стопа — закрываем как "истёк"
 
 DEFAULT_EXCHANGE = "binance"
 
@@ -162,12 +163,13 @@ if DATABASE_URL:
         with _conn() as c:
             with c.cursor() as cur:
                 cur.execute("""
-                    SELECT id, asset_key, direction, take_profit, stop_loss
+                    SELECT id, asset_key, direction, take_profit, stop_loss, issued_at
                     FROM tracked_signals WHERE status='open'
                 """)
                 rows = cur.fetchall()
         return [
-            {"id": r[0], "asset_key": r[1], "direction": r[2], "take_profit": r[3], "stop_loss": r[4]}
+            {"id": r[0], "asset_key": r[1], "direction": r[2], "take_profit": r[3],
+             "stop_loss": r[4], "issued_at": r[5]}
             for r in rows
         ]
 
@@ -185,10 +187,12 @@ if DATABASE_URL:
             with c.cursor() as cur:
                 cur.execute("SELECT status, COUNT(*) FROM tracked_signals GROUP BY status")
                 rows = dict(cur.fetchall())
-        wins, losses, open_ = rows.get("win", 0), rows.get("loss", 0), rows.get("open", 0)
-        total = wins + losses
+        wins, losses = rows.get("win", 0), rows.get("loss", 0)
+        expired, open_ = rows.get("expired", 0), rows.get("open", 0)
+        total = wins + losses  # истёкшие по времени не входят в винрейт — не тейк и не стоп
         return {
-            "wins": wins, "losses": losses, "open": open_, "total_closed": total,
+            "wins": wins, "losses": losses, "expired": expired, "open": open_,
+            "total_closed": total,
             "win_rate": round(100 * wins / total, 1) if total > 0 else None,
         }
 
@@ -300,10 +304,12 @@ else:
         signals = _load_j(SIGNALS_FILE, [])
         wins = sum(1 for s in signals if s["status"] == "win")
         losses = sum(1 for s in signals if s["status"] == "loss")
+        expired = sum(1 for s in signals if s["status"] == "expired")
         open_ = sum(1 for s in signals if s["status"] == "open")
-        total = wins + losses
+        total = wins + losses  # истёкшие по времени не входят в винрейт — не тейк и не стоп
         return {
-            "wins": wins, "losses": losses, "open": open_, "total_closed": total,
+            "wins": wins, "losses": losses, "expired": expired, "open": open_,
+            "total_closed": total,
             "win_rate": round(100 * wins / total, 1) if total > 0 else None,
         }
 
@@ -427,8 +433,10 @@ LANG = {
             "✅ Побед: {wins}\n"
             "❌ Убытков: {losses}\n"
             "📈 Винрейт: {win_rate}\n\n"
+            "⏱ Истекло по времени (24ч, не тейк и не стоп): {expired}\n"
             "⏳ Сейчас открыто: {open}\n\n"
-            "Статистика ведётся с момента запуска трекера — сигналы до этого не учитываются."
+            "Статистика ведётся с момента запуска трекера — сигналы до этого не учитываются. "
+            "Сигнал автоматически закрывается через 24 часа, если не дошёл ни до тейка, ни до стопа."
         ),
         "stats_no_data": "Статистика пока пустая — трекер только что запущен. Первые результаты появятся, как только один из открытых сигналов дойдёт до тейка или стопа.",
         "win_rate_na": "ещё нет закрытых сигналов",
@@ -567,8 +575,10 @@ LANG = {
             "✅ Wins: {wins}\n"
             "❌ Losses: {losses}\n"
             "📈 Win rate: {win_rate}\n\n"
+            "⏱ Expired by time (24h, hit neither TP nor SL): {expired}\n"
             "⏳ Currently open: {open}\n\n"
-            "Tracking started when this update went live — earlier signals aren't included."
+            "Tracking started when this update went live — earlier signals aren't included. "
+            "A signal auto-closes after 24h if it hasn't hit take-profit or stop-loss."
         ),
         "stats_no_data": "No stats yet — the tracker just started. First results will show up once an open signal hits take-profit or stop-loss.",
         "win_rate_na": "no closed signals yet",
@@ -974,10 +984,20 @@ def fmt(data: dict, lang: str, is_auto: bool = False) -> str:
 # ТРЕКЕР ВИНРЕЙТА
 # ================================================================
 
+def _signal_age_hours(issued_at, now: datetime) -> float:
+    """Возраст сигнала в часах. issued_at может прийти как datetime (Postgres) или ISO-строка (JSON)."""
+    if isinstance(issued_at, str):
+        issued_at = datetime.fromisoformat(issued_at)
+    if issued_at.tzinfo is None:
+        issued_at = issued_at.replace(tzinfo=timezone.utc)
+    return (now - issued_at).total_seconds() / 3600
+
 async def check_open_signals():
     open_signals = get_open_tracked_signals()
     if not open_signals:
         return
+
+    now = datetime.now(timezone.utc)
 
     for sig in open_signals:
         cfg = ASSETS.get(sig["asset_key"])
@@ -991,15 +1011,25 @@ async def check_open_signals():
             continue
 
         if sig["direction"] == "LONG":
-            if current_price >= sig["take_profit"]:
-                resolve_tracked_signal(sig["id"], "win", current_price)
-            elif current_price <= sig["stop_loss"]:
-                resolve_tracked_signal(sig["id"], "loss", current_price)
+            hit_tp = current_price >= sig["take_profit"]
+            hit_sl = current_price <= sig["stop_loss"]
         else:
-            if current_price <= sig["take_profit"]:
-                resolve_tracked_signal(sig["id"], "win", current_price)
-            elif current_price >= sig["stop_loss"]:
-                resolve_tracked_signal(sig["id"], "loss", current_price)
+            hit_tp = current_price <= sig["take_profit"]
+            hit_sl = current_price >= sig["stop_loss"]
+
+        if hit_tp:
+            resolve_tracked_signal(sig["id"], "win", current_price)
+            logger.info(f"Сигнал #{sig['id']} ({sig['asset_key']}) — тейк достигнут")
+            continue
+        if hit_sl:
+            resolve_tracked_signal(sig["id"], "loss", current_price)
+            logger.info(f"Сигнал #{sig['id']} ({sig['asset_key']}) — стоп достигнут")
+            continue
+
+        # Ни тейк, ни стоп не задеты — проверяем не истёк ли срок (24 часа)
+        if _signal_age_hours(sig["issued_at"], now) >= SIGNAL_MAX_HOURS:
+            resolve_tracked_signal(sig["id"], "expired", current_price)
+            logger.info(f"Сигнал #{sig['id']} ({sig['asset_key']}) — истёк по времени ({SIGNAL_MAX_HOURS}ч)")
 
 # ================================================================
 # ВЫБОР ЯЗЫКА / БИРЖИ / ПОДПИСОК
@@ -1094,7 +1124,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_rate_str = f"{s['win_rate']}%" if s["win_rate"] is not None else LANG[lang]["win_rate_na"]
     text = LANG[lang]["stats_title"] + "\n\n" + LANG[lang]["stats_body"].format(
         total_closed=s["total_closed"], wins=s["wins"], losses=s["losses"],
-        win_rate=win_rate_str, open=s["open"]
+        win_rate=win_rate_str, expired=s["expired"], open=s["open"]
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
